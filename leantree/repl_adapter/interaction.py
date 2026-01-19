@@ -490,8 +490,30 @@ class LeanProcess:
 
     take_control = to_sync(take_control_async)
 
+    def memory_usage(self) -> int:
+        """
+        Returns the RSS (Resident Set Size) memory usage of the Lean REPL process
+        and all its children in bytes. RSS represents actual physical RAM usage.
+        """
+        self._assert_started()
+        try:
+            process = psutil.Process(self._proc.pid)
+            # Get RSS of the main process
+            total_rss = process.memory_info().rss
+            # Add RSS of all child processes (the actual Lean REPL runs as a child of `lake env`)
+            for child in process.children(recursive=True):
+                try:
+                    total_rss += child.memory_info().rss
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    # Child may have exited between listing and querying
+                    pass
+            return total_rss
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error) as e:
+            raise LeanProcessException(f"Failed to get memory usage", e)
+
     def virtual_memory_usage(self) -> int:
         """
+        Deprecated: Use memory_usage() instead.
         Returns the virtual memory size (VMS) of the Lean REPL process in bytes.
         """
         self._assert_started()

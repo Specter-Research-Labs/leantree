@@ -186,6 +186,14 @@ class LeanProcessPool:
                         self.process_available_event.clear()
                     return process
 
+                # A slot may have opened up (e.g., a high-memory process was terminated)
+                # so we can create a new process
+                if self._num_used_processes < self.max_processes:
+                    process = await self._create_process_async()
+                    self._num_used_processes += 1
+                    self.process_available_event.clear()
+                    return process
+
     async def return_process_async(self, process: LeanProcess):
         """
         Return a process to the pool.
@@ -203,11 +211,11 @@ class LeanProcessPool:
                 should_terminate = True
             else:
                 try:
-                    memory_usage = process.virtual_memory_usage()
+                    memory_usage = process.memory_usage()
                     if self.memory_threshold_per_process and memory_usage > self.memory_threshold_per_process:
-                        self.logger.debug(
-                            f"Process memory usage ({memory_usage / (1024 * 1024):.2f} MB) exceeds threshold "
-                            f"({self.memory_threshold_per_process / (1024 * 1024):.2f} MB). Terminating."
+                        self.logger.info(
+                            f"Process memory usage ({memory_usage / (1024 * 1024):.2f} MB RSS) exceeds threshold "
+                            f"({self.memory_threshold_per_process / (1024 * 1024):.2f} MB). Terminating and replacing."
                         )
                         should_terminate = True
                 except Exception as e:
@@ -230,8 +238,10 @@ class LeanProcessPool:
             if process is not None:
                 # Add back to available processes
                 self.available_processes.append(process)
-                # Set the event to notify waiting coroutines
-                self.process_available_event.set()
+            
+            # Always notify waiting coroutines - either a process is available,
+            # or a slot opened up for creating a new one (when process was terminated)
+            self.process_available_event.set()
 
     return_process = to_sync(return_process_async)
 
