@@ -233,7 +233,6 @@ class LeanServer:
                     server._end_request(request_id)
 
             def _do_POST_inner(self):
-
                 if self.path == "/process/get":
                     self._handle_get_process()
                 elif self.path.startswith("/process/"):
@@ -404,7 +403,7 @@ class LeanServer:
                     proof_branch = proof_branches[0]
                     # Register the branch so we can use it later
                     branch_id = server._register_branch(process_id, proof_branch)
-                    goals = [goal.serialize() for goal in proof_branch._all_goals]
+                    goals = [goal.serialize() for goal in proof_branch.state.goals]
 
                     response = {
                         "branch_id": branch_id,
@@ -436,7 +435,7 @@ class LeanServer:
                         new_branch_id = server._register_branch(process_id, new_branch)
                         branches_data.append({
                             "branch_id": new_branch_id,
-                            "goals": [goal.serialize() for goal in new_branch._all_goals],
+                            "goals": [goal.serialize() for goal in new_branch.state.goals],
                         })
 
                     self._send_json(200, {"value": branches_data})
@@ -448,7 +447,7 @@ class LeanServer:
                     branch = server._get_branch(process_id, branch_id)
                     self._send_json(200, {
                         "branch_id": branch_id,
-                        "goals": [goal.serialize() for goal in branch._all_goals],
+                        "goals": [goal.serialize() for goal in branch.state.goals],
                         "is_solved": branch.is_solved,
                     })
                 except Exception as e:
