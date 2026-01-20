@@ -291,7 +291,7 @@ async def test_proof_from_sorry(project_path: Path):
             proof_branch = result.value
 
             assert proof_branch is not None
-            assert proof_branch._proof_state_id is not None
+            assert proof_branch._branch_id is not None
 
             # Check that we have goals
             state = proof_branch.state

@@ -49,6 +49,11 @@ class LeanServer:
         self._event_loop = None
         self._loop_thread = None
         
+        # Branch tracking: maps (process_id, branch_id) to LeanProofBranch
+        self._branch_id_counter = 0
+        self._branches: dict[tuple[int, int], LeanProofBranch] = {}
+        self._branches_lock = threading.Lock()
+        
         # Request tracking for monitoring
         self._active_requests: dict[int, dict] = {}  # request_id -> {path, start_time, thread_name}
         self._request_id_counter = 0
@@ -80,6 +85,31 @@ class LeanServer:
                 del self._process_id_to_process[process_id]
                 if process in self._process_to_id:
                     del self._process_to_id[process]
+        # Also clean up any branches associated with this process
+        self._remove_branches_for_process(process_id)
+
+    def _register_branch(self, process_id: int, branch: LeanProofBranch) -> int:
+        """Register a branch and return its ID."""
+        with self._branches_lock:
+            self._branch_id_counter += 1
+            branch_id = self._branch_id_counter
+            self._branches[(process_id, branch_id)] = branch
+            return branch_id
+
+    def _get_branch(self, process_id: int, branch_id: int) -> LeanProofBranch:
+        """Get a branch by its ID."""
+        with self._branches_lock:
+            key = (process_id, branch_id)
+            if key not in self._branches:
+                raise ValueError(f"Branch {branch_id} not found for process {process_id}")
+            return self._branches[key]
+
+    def _remove_branches_for_process(self, process_id: int):
+        """Remove all branches associated with a process."""
+        with self._branches_lock:
+            keys_to_remove = [k for k in self._branches if k[0] == process_id]
+            for key in keys_to_remove:
+                del self._branches[key]
 
     def _run_async(self, coro, timeout: float | None = None):
         """Run an async coroutine in the event loop.
@@ -204,14 +234,12 @@ class LeanServer:
                             self._handle_return_process(process_id)
                         elif action == "proof_from_sorry":
                             self._handle_proof_from_sorry(process_id)
-                        elif action == "proof" and len(parts) >= 6:
-                            proof_state_id = int(parts[4])
-                            if parts[5] == "apply_tactic":
-                                self._handle_apply_tactic(process_id, proof_state_id)
-                            elif parts[5] == "try_apply_tactic":
-                                self._handle_try_apply_tactic(process_id, proof_state_id)
+                        elif action == "branch" and len(parts) >= 6:
+                            branch_id = int(parts[4])
+                            if parts[5] == "try_apply_tactic":
+                                self._handle_try_apply_tactic(process_id, branch_id)
                             elif parts[5] == "state":
-                                self._handle_proof_state(process_id, proof_state_id)
+                                self._handle_branch_state(process_id, branch_id)
                             else:
                                 self._send_error(404, "Not Found")
                         else:
@@ -339,92 +367,57 @@ class LeanServer:
                         return
 
                     proof_branch = proof_branches[0]
-                    proof_state_id = proof_branch._proof_state_id
+                    # Register the branch so we can use it later
+                    branch_id = server._register_branch(process_id, proof_branch)
                     goals = [goal.serialize() for goal in proof_branch._all_goals]
 
-                    # Store proof branch info (simplified - in real implementation might want to track these)
                     response = {
-                        "proof_state_id": proof_state_id,
+                        "branch_id": branch_id,
                         "goals": goals,
                     }
                     self._send_json(200, {"value": response})
                 except Exception as e:
                     self._send_error(500, str(e), exception=e)
 
-            def _handle_apply_tactic(self, process_id: int, proof_state_id: int):
+            def _handle_try_apply_tactic(self, process_id: int, branch_id: int):
                 try:
-                    process = server._get_process(process_id)
+                    branch = server._get_branch(process_id, branch_id)
                     data = self._read_json()
                     tactic = data["tactic"]
-                    timeout = data.get("timeout")
+                    timeout = data.get("timeout", 1000)
 
-                    # Create a minimal proof branch to apply tactic
-                    # In a real implementation, we'd track proof branches on the server
-                    payload = {
-                        "tactic": tactic,
-                        "proofState": proof_state_id,
-                    }
-                    if timeout is not None:
-                        payload["timeout"] = timeout
+                    result = server._run_async(
+                        branch.try_apply_tactic_async(tactic, timeout=timeout)
+                    )
 
-                    response_dict = server._run_async(process._send_to_repl_async(payload))
-
-                    # Extract goals and new proof state
-                    new_proof_state_id = response_dict.get("proofState")
-                    goals = LeanProcess._goals_from_response(response_dict)
-
-                    response = {
-                        "proof_state_id": new_proof_state_id,
-                        "goals": [goal.serialize() for goal in goals],
-                    }
-                    self._send_json(200, response)
-                except Exception as e:
-                    self._send_error(500, str(e), exception=e)
-
-            def _handle_try_apply_tactic(self, process_id: int, proof_state_id: int):
-                try:
-                    process = server._get_process(process_id)
-                    data = self._read_json()
-                    tactic = data["tactic"]
-                    timeout = data.get("timeout")
-
-                    # Create a minimal proof branch to apply tactic
-                    payload = {
-                        "tactic": tactic,
-                        "proofState": proof_state_id,
-                    }
-                    if timeout is not None:
-                        payload["timeout"] = timeout
-
-                    response_dict = server._run_async(process._send_to_repl_async(payload))
-
-                    step_error = LeanProofBranch.step_error_from_response(response_dict)
-                    if step_error:
-                        self._send_json(200, {"error": f"Step verification error: {step_error}"})
+                    if not result.is_success():
+                        self._send_json(200, {"error": str(result.error)})
                         return
 
-                    if "goals" not in response_dict:
-                        self._send_json(200, {"error": f"Could not apply tactic in REPL: {json.dumps(response_dict)}"})
-                        return
+                    # Register new branches and return their info
+                    new_branches = result.value
+                    branches_data = []
+                    for new_branch in new_branches:
+                        new_branch_id = server._register_branch(process_id, new_branch)
+                        branches_data.append({
+                            "branch_id": new_branch_id,
+                            "goals": [goal.serialize() for goal in new_branch._all_goals],
+                        })
 
-                    # Extract goals and new proof state
-                    new_proof_state_id = response_dict.get("proofState")
-                    goals = LeanProcess._goals_from_response(response_dict)
-
-                    # Return a list of branches (simplified to 1 for now)
-                    branch_data = {
-                        "proof_state_id": new_proof_state_id,
-                        "goals": [goal.serialize() for goal in goals],
-                    }
-
-                    self._send_json(200, {"value": [branch_data]})
+                    self._send_json(200, {"value": branches_data})
                 except Exception as e:
                     self._send_json(200, {"error": str(e)})
 
-            def _handle_proof_state(self, process_id: int, proof_state_id: int):
-                # This would need to track proof branches on the server
-                # For now, return a simple response
-                self._send_json(200, {"proof_state_id": proof_state_id})
+            def _handle_branch_state(self, process_id: int, branch_id: int):
+                try:
+                    branch = server._get_branch(process_id, branch_id)
+                    self._send_json(200, {
+                        "branch_id": branch_id,
+                        "goals": [goal.serialize() for goal in branch._all_goals],
+                        "is_solved": branch.is_solved,
+                    })
+                except Exception as e:
+                    self._send_error(500, str(e), exception=e)
 
             def _read_json(self) -> dict:
                 content_length = int(self.headers.get("Content-Length", 0))
@@ -585,20 +578,24 @@ class LeanRemoteProcess:
         value = response["value"]
         return ValueOrError.from_success(RemoteLeanProofBranch(
             self,  # Pass the LeanRemoteProcess to keep it alive
-            value["proof_state_id"],
+            value["branch_id"],
             value["goals"]
         ))
 
 
 class RemoteLeanProofBranch:
-    """A remote proof branch managed by a LeanServer."""
+    """A remote proof branch managed by a LeanServer.
+    
+    This is a thin client-side proxy that maps 1:1 to a LeanProofBranch on the server.
+    All operations are delegated to the server-side branch.
+    """
 
-    def __init__(self, remote_process: LeanRemoteProcess, proof_state_id: int, goals: list[dict]):
+    def __init__(self, remote_process: LeanRemoteProcess, branch_id: int, goals: list[dict]):
         # Hold a reference to the LeanRemoteProcess to prevent it from being
         # garbage collected (and returning the process to the pool) while this
         # proof branch is still in use.
         self._remote_process = remote_process
-        self._proof_state_id = proof_state_id
+        self._branch_id = branch_id
         self._goals = [LeanGoal.deserialize(g) for g in goals]
 
     @property
@@ -614,23 +611,35 @@ class RemoteLeanProofBranch:
         """Get the current proof state."""
         return LeanProofState(self._goals)
 
+    @property
+    def is_solved(self) -> bool:
+        """Check if the proof is solved."""
+        return self.state.is_solved()
+
     def try_apply_tactic(
             self,
             tactic: LeanTactic | str,
             ban_search_tactics: bool = True,
             timeout: int | None = 1000,
     ) -> ValueOrError[list["RemoteLeanProofBranch"]]:
-        """Apply a tactic to the proof branch."""
+        """Apply a tactic to the proof branch.
+        
+        This delegates to LeanProofBranch.try_apply_tactic_async on the server,
+        ensuring identical behavior to local execution.
+        """
         if isinstance(tactic, LeanTactic):
             tactic = tactic.tactic
 
-        data = {"tactic": tactic}
+        data = {
+            "tactic": tactic,
+            "ban_search_tactics": ban_search_tactics,
+        }
         if timeout is not None:
             data["timeout"] = timeout
 
         response = self.client._request(
             "POST",
-            f"/process/{self.process_id}/proof/{self._proof_state_id}/try_apply_tactic",
+            f"/process/{self.process_id}/branch/{self._branch_id}/try_apply_tactic",
             data
         )
 
@@ -642,7 +651,7 @@ class RemoteLeanProofBranch:
         for branch_data in branches_data:
             branches.append(RemoteLeanProofBranch(
                 self._remote_process,  # Pass the LeanRemoteProcess to keep it alive
-                branch_data["proof_state_id"],
+                branch_data["branch_id"],
                 branch_data["goals"]
             ))
 
