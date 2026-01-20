@@ -1,15 +1,42 @@
 """CLI script to start the Lean server."""
 
 import argparse
+import atexit
 import os
 import signal
 import sys
+import termios
 import threading
 from pathlib import Path
 
 from leantree.repl_adapter.server import start_server, LeanClient
 from leantree.repl_adapter.process_pool import LeanProcessPool
 from leantree.utils import Logger, LogLevel
+
+# Terminal settings preservation
+# ----------------------------
+# The keyboard_monitor thread uses input() to read keypresses, which can modify
+# terminal settings (e.g., disabling echo mode). If the process is killed via
+# Ctrl+C while input() is active, these settings may not be restored, leaving
+# the terminal in a broken state (characters you type are not displayed).
+# We save the original settings at startup and restore them on exit.
+_original_terminal_settings = None
+try:
+    _original_terminal_settings = termios.tcgetattr(sys.stdin)
+except (termios.error, AttributeError):
+    pass  # Not a terminal or termios not available
+
+
+def _restore_terminal():
+    """Restore terminal settings to their original state."""
+    if _original_terminal_settings is not None:
+        try:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, _original_terminal_settings)
+        except (termios.error, AttributeError):
+            pass
+
+
+atexit.register(_restore_terminal)
 
 
 def main():
@@ -135,6 +162,8 @@ def main():
         # (pool's asyncio primitives are bound to that loop)
         server._run_async(pool.shutdown_async())
         server.stop()
+        # Restore terminal settings (input() in keyboard_monitor can leave terminal in bad state)
+        _restore_terminal()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
