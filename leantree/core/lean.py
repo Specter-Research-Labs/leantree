@@ -13,7 +13,7 @@ class LeanHypothesis:
     mvar_id: str | None = None
 
     # Matches: "name : type", then optionally ":= value"
-    HypothesisLineRegex: ClassVar[re.Pattern] = re.compile(r"^([^:]+):(.+)")
+    HypothesisLineRegex: ClassVar[re.Pattern] = re.compile(r"^([^:]+):(.+)", re.DOTALL)
 
     # TODO: the decision what to serialize should be in the dataset generator, not here
     def serialize(self) -> dict:
@@ -48,30 +48,29 @@ class LeanHypothesis:
         #   ∀ (x : α),
         #     traverse F ({ head := x, tail := tl } * { head := y, tail := L2 }) =
         #       (fun x1 x2 => x1 * x2) <$> traverse F { head := x, tail := tl } <*> traverse F { head := y, tail := L2 }
+        # to𝕜 : (E →L[ℝ] ℝ) → E →L[𝕜] 𝕜 := fun fr =>
+        #   let __LinearMap := (↑fr).extendTo𝕜';
+        #   { toLinearMap := __LinearMap, cont := ⋯ }
 
-        s = re.sub(r"\s+", " ", s.strip())
-
-        match = LeanHypothesis.HypothesisLineRegex.match(s)
+        match = LeanHypothesis.HypothesisLineRegex.match(s.strip())
         names_str, hyp_type = match.group(1).strip(), match.group(2).strip()
         names = names_str.split()
 
         value = None
-        assign_signs_indices = cls._find_unbracketed_assign_signs(hyp_type)
-        assert len(assign_signs_indices) <= 1
-        if assign_signs_indices:
+        assign_signs_index = cls._find_first_unbracketed_assign_sign(hyp_type)
+        if assign_signs_index is not None:
             hyp_type, value = (
-                hyp_type[:assign_signs_indices[0]].strip(),
-                hyp_type[assign_signs_indices[0] + 2:].strip()
+                hyp_type[:assign_signs_index].strip(),
+                hyp_type[assign_signs_index + 2:].strip()
             )
 
         return [LeanHypothesis(hyp_type, name, value) for name in names]
 
     # TODO: unit test
     @classmethod
-    def _find_unbracketed_assign_signs(cls, s: str) -> list[int]:
+    def _find_first_unbracketed_assign_sign(cls, s: str) -> int | None:
         brackets = ["()", "[]", "{}", "⦃⦄", "⟨⟩", "⁅⁆"]
         depths = {b: 0 for b in brackets}
-        result = []
         for i in range(len(s) - 1):
             for b in brackets:
                 if s[i] == b[0]:
@@ -80,8 +79,8 @@ class LeanHypothesis:
                     assert depths[b] > 0
                     depths[b] -= 1
             if s[i:i + 2] == ":=" and all(d == 0 for d in depths.values()):
-                result.append(i)
-        return result
+                return i
+        return None
 
 
 @dataclass(eq=False, frozen=True)
@@ -135,7 +134,7 @@ class LeanGoal(ProofGoal):
             tag = tag_match.group(1).strip()
             goal_str = goal_str[len(tag_match.group(0)):].strip()
 
-        assert goal_str.count(LeanGoal.TargetSymbol) == 1
+        assert goal_str.count(LeanGoal.TargetSymbol) == 1, f"Expected exactly one '⊢' in the goal, but got {goal_str.count(LeanGoal.TargetSymbol)}"
         hypotheses_str, type_str = goal_str.split(LeanGoal.TargetSymbol)
 
         curr_hypothesis = ""
