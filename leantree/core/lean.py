@@ -141,6 +141,10 @@ class LeanGoal(ProofGoal):
         hypotheses = []
         for line in [line for line in hypotheses_str.splitlines() if len(line.strip()) != 0]:
             # Indented line means continuation of the hypothesis. So does a line without ":" (mostly).
+            # TODO: a line can contain ":" but still be a continuation; example:
+            #  map_sInf : let x := minAx.toCompleteLattice;                                                                                                                                                                                               
+            #  ∀ (s : Set α), f (sInf s) = ⨅ a ∈ s, f a
+            #  -> maybe use the semicolon as line continuation indicator
             if curr_hypothesis and (line[0] != " " and ":" in line):
                 hypotheses.extend(LeanHypothesis.from_string(curr_hypothesis))
                 curr_hypothesis = ""
