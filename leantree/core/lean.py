@@ -113,10 +113,11 @@ class LeanGoal(ProofGoal):
         )
 
     def __str__(self):
+        hypotheses_str = "\n".join(str(h) for h in self.hypotheses)
         return (
                 (f"case {self.tag}\n" if self.tag else "") +
-                "\n".join(h.__str__() for h in self.hypotheses) +
-                f"\n{self.TargetSymbol} {self.type}"
+                (hypotheses_str + "\n" if hypotheses_str else "") +
+                f"{self.TargetSymbol} {self.type}"
         )
 
     def with_(self, **changes) -> Self:
