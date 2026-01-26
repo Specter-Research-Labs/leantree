@@ -250,9 +250,6 @@ class LeanProcess:
             raise LeanInteractionException("Tactic application timed out.")
         if message and message.startswith("Lean error:"):
             raise LeanInteractionException(f"REPL returned error: {message}")
-        # If the response only contains a message and nothing else useful, treat it as an error
-        if message and "env" not in response:
-            raise LeanInteractionException(f"REPL returned message without env: {message}")
 
         return response
 
