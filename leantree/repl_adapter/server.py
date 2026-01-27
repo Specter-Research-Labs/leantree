@@ -244,6 +244,8 @@ class LeanServer:
                             self._handle_command(process_id)
                         elif action == "return":
                             self._handle_return_process(process_id)
+                        elif action == "is_valid_source":
+                            self._handle_is_valid_source(process_id)
                         elif action == "proof_from_sorry":
                             self._handle_proof_from_sorry(process_id)
                         elif action == "branch" and len(parts) >= 6:
@@ -356,6 +358,17 @@ class LeanServer:
 
                     response = server._run_async(process.send_command_async(command))
                     self._send_json(200, response)
+                except Exception as e:
+                    self._send_error(500, str(e), exception=e)
+
+            def _handle_is_valid_source(self, process_id: int):
+                try:
+                    process = server._get_process(process_id)
+                    data = self._read_json()
+                    source = data["source"]
+
+                    is_valid = server._run_async(process.is_valid_source_async(source))
+                    self._send_json(200, {"is_valid": is_valid})
                 except Exception as e:
                     self._send_error(500, str(e), exception=e)
 
@@ -589,6 +602,17 @@ class LeanRemoteProcess:
                 f"/process/{self.process_id}/command",
                 {"command": command}
             )
+
+    def is_valid_source(self, source: str) -> bool:
+        """Check if the source is valid Lean code."""
+        with self._lock:
+            self._check_not_returned()
+            response = self.client._request(
+                "POST",
+                f"/process/{self.process_id}/is_valid_source",
+                {"source": source}
+            )
+            return response["is_valid"]
 
     def return_process(self):
         """Return the process to the pool. Safe to call multiple times."""
