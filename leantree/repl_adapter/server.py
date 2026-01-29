@@ -21,6 +21,8 @@ from leantree.utils import serialize_exception, deserialize_exception, ValueOrEr
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     """HTTP server that handles each request in a separate thread."""
     daemon_threads = True
+    # Increase listen backlog for high-load scenarios (default is usually 5)
+    request_queue_size = 128
 
 
 class LeanServer:
