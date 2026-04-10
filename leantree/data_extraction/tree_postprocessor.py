@@ -56,9 +56,13 @@ class ProofTreePostprocessor:
         cases_match = re.search(r"^(cases\s+[^\n]+)with\s+", tactic_str)
         induction_match = re.search(r"^(induction\s+[^\n]+)with\s+", tactic_str)
         if cases_match:
+            if node.tactic.ast is None:
+                return
             constructors = cls._extract_cases_constructors(node)
             match = cases_match
         elif induction_match:
+            if node.tactic.ast is None:
+                return
             constructors = cls._extract_induction_constructors(node)
             match = induction_match
         else:
@@ -147,74 +151,51 @@ class ProofTreePostprocessor:
         node.tactic.goals_after.insert(0, node.tactic.spawned_goals[0])
         node.tactic.spawned_goals = []
 
-    # TODO: deduplicate?
     @classmethod
-    def _extract_cases_constructors(cls, node: SingletonProofTreeNode) -> list[str]:
-        ast_node = node.tactic.ast.root
-        assert (
-                isinstance(ast_node, LeanASTObject) and
-                len(ast_node.args) == 4 and
-                ast_node.args[0].pretty_print() == "cases"
+    def _find_induction_alts(cls, ast_node, tactic_name: str) -> list[str]:
+        """Extract constructor names from cases/induction AST by finding the inductionAlts node."""
+        # Find the inductionAlts node — its position may vary across Lean versions,
+        # and the no_children infotree mode may strip the outer node leaving a flat array.
+        alts_node = ast_node.find_first_node(
+            lambda n: isinstance(n, LeanASTObject) and n.type == "Tactic.inductionAlts"
         )
-        alts_array = ast_node.args[3]
-        assert isinstance(alts_array, LeanASTArray) and len(alts_array.items) == 1
-        alts_node = alts_array.items[0]
-        assert (
-                isinstance(alts_node, LeanASTObject) and
-                alts_node.type == "Tactic.inductionAlts" and
-                len(alts_node.args) == 3 and
-                alts_node.args[0].pretty_print() == "with"
+        assert alts_node is not None, (
+            f"Could not find Tactic.inductionAlts in `{tactic_name}` AST"
         )
+        assert (
+            len(alts_node.args) >= 3 and
+            alts_node.args[0].pretty_print() == "with"
+        ), f"Unexpected inductionAlts structure: {[a.pretty_print() if hasattr(a, 'pretty_print') else str(a) for a in alts_node.args[:3]]}"
+
         alts = alts_node.args[2]
-        assert isinstance(alts, LeanASTArray)
+        assert isinstance(alts, LeanASTArray), (
+            f"Expected array of alternatives, got {type(alts).__name__}"
+        )
 
         constructors = []
         for alt in alts.items:
             assert (
-                    isinstance(alt, LeanASTObject) and
-                    alt.type == "Tactic.inductionAlt" and
-                    len(alt.args) == 3 and
-                    alt.args[1].pretty_print() == "=>"
+                isinstance(alt, LeanASTObject) and
+                alt.type == "Tactic.inductionAlt"
+            ), f"Expected Tactic.inductionAlt, got {alt.type if isinstance(alt, LeanASTObject) else type(alt).__name__}"
+            assert len(alt.args) >= 3 and alt.args[1].pretty_print() == "=>", (
+                f"Unexpected inductionAlt structure"
             )
             constructor_tokens = alt.args[0].get_tokens()
-            assert constructor_tokens[0] == "|"
+            assert constructor_tokens[0] == "|", (
+                f"Expected '|' token, got '{constructor_tokens[0]}'"
+            )
             constructor = " ".join(constructor_tokens[1:])
             constructors.append(constructor)
         return constructors
+
+    @classmethod
+    def _extract_cases_constructors(cls, node: SingletonProofTreeNode) -> list[str]:
+        return cls._find_induction_alts(node.tactic.ast.root, "cases")
 
     @classmethod
     def _extract_induction_constructors(cls, node: SingletonProofTreeNode) -> list[str]:
-        ast_node = node.tactic.ast.root
-        assert (
-                isinstance(ast_node, LeanASTObject) and
-                len(ast_node.args) == 5 and
-                ast_node.args[0].pretty_print() == "induction"
-        )
-        alts_array = ast_node.args[4]
-        assert isinstance(alts_array, LeanASTArray) and len(alts_array.items) == 1
-        alts_node = alts_array.items[0]
-        assert (
-                isinstance(alts_node, LeanASTObject) and
-                alts_node.type == "Tactic.inductionAlts" and
-                len(alts_node.args) == 3 and
-                alts_node.args[0].pretty_print() == "with"
-        )
-        alts = alts_node.args[2]
-        assert isinstance(alts, LeanASTArray)
-
-        constructors = []
-        for alt in alts.items:
-            assert (
-                    isinstance(alt, LeanASTObject) and
-                    alt.type == "Tactic.inductionAlt" and
-                    len(alt.args) == 3 and
-                    alt.args[1].pretty_print() == "=>"
-            )
-            constructor_tokens = alt.args[0].get_tokens()
-            assert constructor_tokens[0] == "|"
-            constructor = " ".join(constructor_tokens[1:])
-            constructors.append(constructor)
-        return constructors
+        return cls._find_induction_alts(node.tactic.ast.root, "induction")
 
     @classmethod
     def _transform_simp_rw(cls, node: SingletonProofTreeNode):

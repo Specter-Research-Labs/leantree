@@ -76,8 +76,12 @@ class LeanFileParser:
         imports = []
         with open(path) as f:
             for line in f:
-                if line.startswith("import "):
-                    imports.append(line[len("import "):].strip())
+                line = line.strip()
+                # Lean 4.29+ module system: "public import X", "private import X"
+                for prefix in ("public import ", "private import ", "import "):
+                    if line.startswith(prefix):
+                        imports.append(line[len(prefix):].strip())
+                        break
         return imports
 
     @classmethod

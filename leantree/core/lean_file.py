@@ -92,10 +92,11 @@ class LeanFile:
     path: Path
     imports: list[str]
     theorems: list[LeanTheorem | StoredError]
+    relative_path: Path | None = None
 
     def serialize(self) -> dict:
         return {
-            "path": str(self.path),
+            "path": str(self.relative_path or self.path),
             "imports": self.imports,
             "theorems": [t.serialize() for t in self.theorems]
         }

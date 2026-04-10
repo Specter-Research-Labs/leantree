@@ -86,10 +86,15 @@ class LeanProject:
                 else:
                     raise
 
+        file_path = Path(loaded_file.path)
+        packages_dir = self.path / ".lake" / "packages"
+        relative_path = file_path.relative_to(packages_dir) if file_path.is_relative_to(packages_dir) else file_path
+
         file = LeanFile(
-            path=Path(loaded_file.path),
+            path=file_path,
             imports=loaded_file.imports,
             theorems=[],
+            relative_path=relative_path,
         )
         block_to_tree: dict[LeanTacticBlock, SingletonProofTree] = {}
         for unit in loaded_file.units:
