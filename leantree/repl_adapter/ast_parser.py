@@ -119,7 +119,7 @@ class LeanAST:
             i = start_idx
             # Addresses arguments like «term(↑)»
             depths = {b: 0 for b in ["«»"]}
-            while not (s[i] in [*string.whitespace, *")]"] and all(d == 0 for d in depths.values())):
+            while i < len(s) and not (s[i] in [*string.whitespace, *")]"] and all(d == 0 for d in depths.values())):
                 for b in depths:
                     if s[i] == b[0]:
                         depths[b] += 1
@@ -131,7 +131,7 @@ class LeanAST:
 
         def skip_whitespaces(start_idx: int) -> int:
             i = start_idx
-            while s[i] in string.whitespace:
+            while i < len(s) and s[i] in string.whitespace:
                 i += 1
             return i
 
