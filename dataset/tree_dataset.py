@@ -113,7 +113,7 @@ def generate_dataset(args: argparse.Namespace):
         args.worker_id = 0
         args.total_workers = 1
 
-    out_file = args.output_dir / f"lean-trees-{descriptor}-{args.worker_id}.jsonl"
+    out_file = args.output_dir / f"leantree-{descriptor}-{args.worker_id}.jsonl"
     if not args.force:
         if out_file.exists():
             print(f"Exiting because output file already exists: {out_file}")

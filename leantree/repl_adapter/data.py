@@ -37,8 +37,18 @@ class ReplProofStepInfo:
             mctx_after=MetavarGraph.from_dict(data["mctxAfter"]) if data["mctxAfter"] else None,
             tactic_depends_on=data["tacticDependsOn"],
             span=FilePositionParser.create_file_span(data, file_line_lengths) if data["start"] else None,
-            ast=LeanAST.parse_from_string(data["infoTree"]["node"]["stx"]["raw"]) if data["infoTree"] else None,
+            ast=cls._try_parse_ast(data["infoTree"]),
         )
+
+
+    @staticmethod
+    def _try_parse_ast(info_tree: dict | None):
+        if not info_tree:
+            return None
+        try:
+            return LeanAST.parse_from_string(info_tree["node"]["stx"]["raw"])
+        except (IndexError, KeyError, ValueError):
+            return None
 
 
 class ReplGoalInfo:

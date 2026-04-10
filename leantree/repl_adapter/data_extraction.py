@@ -93,7 +93,7 @@ class LeanFileParser:
         cmd = ["lake", "env", str(repl_exe_path)]
         # file_content = cls._preprocess_file_content(file.read_text())
         # input_data = json.dumps({"cmd": file_content, "proofTrees": True, "infotree": "no_children"}) + "\n\n\n"
-        input_data = json.dumps({"path": str(file), "proofTrees": True, "infotree": "no_children"}) + "\n\n\n"
+        input_data = json.dumps({"path": str(file), "proofTrees": True, "infotree": "no_children"}) + "\n\n"
         # print(f"Running '{" ".join(cmd)}' in '{project_path}' with input '{input_data.strip()}' (stripped)")
         result = subprocess.run(
             cmd,
