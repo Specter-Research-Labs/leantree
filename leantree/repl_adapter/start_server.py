@@ -156,8 +156,16 @@ def main():
     print(f"Server started on http://{args.address}:{args.port} with log level {args.log_level}")
 
     # Handle shutdown gracefully
+    _shutting_down = False
+
     def signal_handler(sig, frame):
-        print("\nShutting down server...")
+        nonlocal _shutting_down
+        if _shutting_down:
+            print("\nForced shutdown.")
+            _restore_terminal()
+            os._exit(1)
+        _shutting_down = True
+        print("\nShutting down server... (press Ctrl+C again to force quit)")
         # Shut down pool on the server's event loop before stopping it
         # (pool's asyncio primitives are bound to that loop)
         server._run_async(pool.shutdown_async())
