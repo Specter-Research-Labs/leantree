@@ -492,24 +492,33 @@ class LeanProcess:
 
     def memory_usage(self) -> int:
         """
-        Returns the RSS (Resident Set Size) memory usage of the Lean REPL process
-        and all its children in bytes. RSS represents actual physical RAM usage.
+        Returns the PSS (Proportional Set Size) memory usage of the Lean REPL process
+        and all its children in bytes. PSS divides shared pages by the number of
+        processes sharing them, avoiding the overcounting that RSS suffers from when
+        many processes share memory-mapped files (e.g. Mathlib .olean files).
+
+        Falls back to RSS on platforms where PSS is unavailable (non-Linux).
         """
         self._assert_started()
         try:
             process = psutil.Process(self._proc.pid)
-            # Get RSS of the main process
-            total_rss = process.memory_info().rss
-            # Add RSS of all child processes (the actual Lean REPL runs as a child of `lake env`)
+            total = self._process_pss_or_rss(process)
             for child in process.children(recursive=True):
                 try:
-                    total_rss += child.memory_info().rss
+                    total += self._process_pss_or_rss(child)
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    # Child may have exited between listing and querying
                     pass
-            return total_rss
+            return total
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error) as e:
             raise LeanProcessException(f"Failed to get memory usage", e)
+
+    @staticmethod
+    def _process_pss_or_rss(process: psutil.Process) -> int:
+        """Return PSS if available (Linux), otherwise fall back to RSS."""
+        try:
+            return process.memory_full_info().pss
+        except (AttributeError, psutil.AccessDenied):
+            return process.memory_info().rss
 
     def virtual_memory_usage(self) -> int:
         """
