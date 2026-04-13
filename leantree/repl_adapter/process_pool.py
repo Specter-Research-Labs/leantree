@@ -97,28 +97,67 @@ class LeanProcessPool:
     async def max_out_processes_async(self):
         """
         Start processes in parallel until we reach max_processes capacity.
-        
-        This method ensures that len(self.available_processes) + self._num_used_processes 
+
+        This method ensures that len(self.available_processes) + self._num_used_processes
         equals self.max_processes by starting new processes in parallel.
         """
         async with self.lock:
             processes_to_start = self.max_processes - (len(self.available_processes) + self._num_used_processes)
             if processes_to_start <= 0:
                 return
-
             self.logger.info(f"Starting {processes_to_start} processes in parallel")
 
-            # Start processes in parallel.
-            tasks = [self._create_process_async() for _ in range(processes_to_start)]
-            new_processes = await asyncio.gather(*tasks)
+        # Create processes OUTSIDE the lock
+        tasks = [self._create_process_async() for _ in range(processes_to_start)]
+        new_processes = await asyncio.gather(*tasks)
 
+        async with self.lock:
             self.available_processes.extend(new_processes)
-
             if self.available_processes:
                 self.process_available_event.set()
-
             self.logger.info(
                 f"Started {len(new_processes)} processes. Available: {len(self.available_processes)}, Used: {self._num_used_processes}")
+
+    async def _get_or_create_process_async(self) -> LeanProcess | None:
+        """Try to get an available process or reserve a slot and create one.
+
+        Returns a process if one was available or successfully created,
+        None if at capacity with no available processes.
+
+        The lock is only held briefly to check/update counters; the slow
+        process creation happens outside the lock.
+        """
+        async with self.lock:
+            if self._was_shutdown:
+                raise RuntimeError("Process pool has been shut down")
+
+            if self.available_processes:
+                process = self.available_processes.pop()
+                if not self.available_processes:
+                    self.process_available_event.clear()
+                self._num_used_processes += 1
+                return process
+
+            # Reserve a slot for a new process (but create it outside the lock)
+            if self._num_used_processes < self.max_processes:
+                self._num_used_processes += 1
+                need_create = True
+            else:
+                need_create = False
+
+        if not need_create:
+            return None
+
+        # Create the process OUTSIDE the lock so returns aren't blocked
+        try:
+            process = await self._create_process_async()
+            return process
+        except Exception:
+            # Release the reserved slot on failure
+            async with self.lock:
+                self._num_used_processes -= 1
+                self.process_available_event.set()
+            raise
 
     async def get_process_async(self, blocking: bool = True, timeout: float | None = None) -> LeanProcess | None:
         """
@@ -135,22 +174,9 @@ class LeanProcessPool:
         Raises:
             RuntimeError: If the pool has been shut down
         """
-        async with self.lock:
-            if self._was_shutdown:
-                raise RuntimeError("Process pool has been shut down")
-
-            if self.available_processes:
-                process = self.available_processes.pop()
-                if not self.available_processes:
-                    self.process_available_event.clear()
-                self._num_used_processes += 1
-                return process
-
-            # If we haven't reached max processes, create a new one.
-            if self._num_used_processes < self.max_processes:
-                process = await self._create_process_async()
-                self._num_used_processes += 1
-                return process
+        process = await self._get_or_create_process_async()
+        if process is not None:
+            return process
 
         # No processes available and at max capacity
         if not blocking:
@@ -175,24 +201,9 @@ class LeanProcessPool:
                 # Continue waiting if timeout occurs (unless total timeout expired)
                 pass
 
-            async with self.lock:
-                if self._was_shutdown:
-                    raise RuntimeError("Process pool has been shut down")
-
-                if self.available_processes:
-                    process = self.available_processes.pop()
-                    self._num_used_processes += 1
-                    if not self.available_processes:
-                        self.process_available_event.clear()
-                    return process
-
-                # A slot may have opened up (e.g., a high-memory process was terminated)
-                # so we can create a new process
-                if self._num_used_processes < self.max_processes:
-                    process = await self._create_process_async()
-                    self._num_used_processes += 1
-                    self.process_available_event.clear()
-                    return process
+            process = await self._get_or_create_process_async()
+            if process is not None:
+                return process
 
     async def return_process_async(self, process: LeanProcess):
         """
@@ -205,42 +216,45 @@ class LeanProcessPool:
             process: The LeanProcess instance to return
         """
 
+        # Check memory and do slow cleanup OUTSIDE the lock
+        should_terminate = False
         async with self.lock:
-            should_terminate = False
             if self._was_shutdown:
                 should_terminate = True
-            else:
-                try:
-                    memory_usage = process.memory_usage()
-                    if self.memory_threshold_per_process and memory_usage > self.memory_threshold_per_process:
-                        self.logger.info(
-                            f"Process memory usage ({memory_usage / (1024 * 1024):.2f} MB RSS) exceeds threshold "
-                            f"({self.memory_threshold_per_process / (1024 * 1024):.2f} MB). Terminating and replacing."
-                        )
-                        should_terminate = True
-                except Exception as e:
-                    self.logger.warning(f"Error checking process memory: {e}. Terminating process.")
+
+        if not should_terminate:
+            try:
+                memory_usage = process.memory_usage()
+                if self.memory_threshold_per_process and memory_usage > self.memory_threshold_per_process:
+                    self.logger.info(
+                        f"Process memory usage ({memory_usage / (1024 * 1024):.2f} MB RSS) exceeds threshold "
+                        f"({self.memory_threshold_per_process / (1024 * 1024):.2f} MB). Terminating and replacing."
+                    )
                     should_terminate = True
+            except Exception as e:
+                self.logger.warning(f"Error checking process memory: {e}. Terminating process.")
+                should_terminate = True
 
-            if should_terminate:
-                await process.stop_async()
+        if should_terminate:
+            await process.stop_async()
+            async with self.lock:
                 self.checkpoints.pop(process, None)
-                process = None
+                assert self._num_used_processes > 0, "No processes in use"
+                self._num_used_processes -= 1
+                self.process_available_event.set()
+            return
 
-            if process is not None:
-                await process.drain_repl_output_async()
-                if process in self.checkpoints:
-                    process.rollback_to(self.checkpoints[process])
+        # Drain and rollback outside the lock (drain is near-instant,
+        # rollback is just an int assignment)
+        await process.drain_repl_output_async()
+        if process in self.checkpoints:
+            process.rollback_to(self.checkpoints[process])
 
+        async with self.lock:
             assert self._num_used_processes > 0, "No processes in use"
             self._num_used_processes -= 1
-
-            if process is not None:
-                # Add back to available processes
-                self.available_processes.append(process)
-            
-            # Always notify waiting coroutines - either a process is available,
-            # or a slot opened up for creating a new one (when process was terminated)
+            self.available_processes.append(process)
+            # Notify waiting coroutines that a process is available
             self.process_available_event.set()
 
     return_process = to_sync(return_process_async)
