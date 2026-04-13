@@ -68,6 +68,12 @@ class ProofTreePostprocessor:
         else:
             return
 
+        if constructors is None:
+            # BetterParser already decomposed the alternatives into separate steps.
+            # Just trim the "with ..." suffix from the tactic string.
+            node.tactic.tactic_string = match.group(1).rstrip()
+            return
+
         assert len(constructors) == len(node.tactic.spawned_goals),\
             "Different number of constructors and spawned goal for cases/induction."
         intermezzo_nodes = []
@@ -152,16 +158,15 @@ class ProofTreePostprocessor:
         node.tactic.spawned_goals = []
 
     @classmethod
-    def _find_induction_alts(cls, ast_node, tactic_name: str) -> list[str]:
-        """Extract constructor names from cases/induction AST by finding the inductionAlts node."""
-        # Find the inductionAlts node — its position may vary across Lean versions,
-        # and the no_children infotree mode may strip the outer node leaving a flat array.
+    def _find_induction_alts(cls, ast_node, tactic_name: str) -> list[str] | None:
+        """Extract constructor names from cases/induction AST by finding the inductionAlts node.
+        Returns None if not found — this happens when BetterParser already decomposed the
+        alternatives into separate proof steps (each branch is its own step with goal matching)."""
         alts_node = ast_node.find_first_node(
             lambda n: isinstance(n, LeanASTObject) and n.type == "Tactic.inductionAlts"
         )
-        assert alts_node is not None, (
-            f"Could not find Tactic.inductionAlts in `{tactic_name}` AST"
-        )
+        if alts_node is None:
+            return None
         assert (
             len(alts_node.args) >= 3 and
             alts_node.args[0].pretty_print() == "with"
