@@ -129,10 +129,11 @@ def generate_dataset(args: argparse.Namespace):
     paths = list(paths)
     batch_size = len(paths) // args.total_workers
     offset = args.worker_id * batch_size
-    paths = itertools.islice(paths, offset, offset + batch_size)
-    paths = list(paths)
+    # Last worker picks up remainder files
+    end = offset + batch_size if args.worker_id < args.total_workers - 1 else len(paths)
+    paths = paths[offset:end]
     print(
-        f"Will process {len(paths)} paths (worker {args.worker_id} of {args.total_workers}, files {offset} - {offset + batch_size})."
+        f"Will process {len(paths)} paths (worker {args.worker_id} of {args.total_workers}, files {offset} - {offset + len(paths)})."
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -273,7 +274,7 @@ def merge_shards(args):
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    output_file = output_dir / "lean-trees-sf=mathlib_Mathlib.jsonl"
+    output_file = output_dir / "leantree-sf=mathlib_Mathlib.jsonl"
     if output_file.exists() and not args.force:
         raise Exception(f"Output file {output_file} already exists")
 
@@ -281,7 +282,7 @@ def merge_shards(args):
 
     with open(output_file, 'w') as out_f:
         for i in tqdm(range(args.shards_count)):
-            shard_file = shard_dir / f"lean-trees-sf=mathlib_Mathlib-{i}.jsonl"
+            shard_file = shard_dir / f"leantree-sf=mathlib_Mathlib-{i}.jsonl"
             if not shard_file.exists():
                 raise Exception(f"Shard file {shard_file} does not exist")
 
