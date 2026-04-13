@@ -112,18 +112,13 @@ class ProofTreeNode:
         )
 
     def serialize(self) -> dict:
-        data = {
+        return {
             "id": self.id,
-            "state": self.state.serialize()
+            "state": self.state.serialize(),
+            "tactic": self.tactic.serialize() if self.tactic is not None else None,
+            "proof_size": self.proof_size if self.tactic is not None else None,
+            "proof_depth": self.proof_depth if self.tactic is not None else None,
         }
-        if self.tactic is not None:
-            data = {
-                **data,
-                "tactic": self.tactic.serialize(),
-                "proof_size": self.proof_size,
-                "proof_depth": self.proof_depth,
-            }
-        return data
 
     @classmethod
     def deserialize(

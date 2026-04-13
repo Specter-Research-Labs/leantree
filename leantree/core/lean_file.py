@@ -31,16 +31,26 @@ class LeanTacticBlock:
 
     # TODO: the decision what to serialize should be in the dataset generator, not here
     def serialize(self) -> dict:
+        if isinstance(self.tree, StoredError):
+            tree = {"nodes": [], "root_id": None, "error": self.tree.error}
+        else:
+            tree = {**self.tree.serialize(), "error": None}
         return {
-            "tree": self.tree.serialize(),
+            "tree": tree,
             "span": self.span.serialize(),
         }
 
     @classmethod
     def deserialize(cls, data: dict, theorem: "LeanTheorem") -> "LeanTacticBlock":
+        tree_data = data["tree"]
+        error = tree_data.get("error")
+        if error is not None:
+            tree = StoredError(error)
+        else:
+            tree = ProofTree.deserialize(tree_data)
         return LeanTacticBlock(
             theorem=theorem,
-            tree=ProofTree.deserialize(data["tree"]) if data["tree"].get("error") is None else StoredError.deserialize(data["tree"]),
+            tree=tree,
             span=FileSpan.deserialize(data["span"]),
         )
 
@@ -57,15 +67,23 @@ class LeanTheorem:
     context: list[str]
     name: str | None = None
 
+    @staticmethod
+    def _serialize_block(b) -> dict:
+        if isinstance(b, StoredError):
+            return {
+                "tree": {"nodes": [], "root_id": None, "error": b.error},
+                "span": None,
+            }
+        return b.serialize()
+
     def serialize(self) -> dict:
-        data = {
+        return {
             "span": self.span.serialize(),
-            "by_blocks": [b.serialize() for b in self.by_blocks],
+            "by_blocks": [self._serialize_block(b) for b in self.by_blocks],
             "context": self.context,
+            "name": self.name,
+            "error": None,
         }
-        if self.name is not None:
-            data["name"] = self.name
-        return data
 
     @classmethod
     def deserialize(cls, data: dict, file: "LeanFile | None" = None) -> "LeanTheorem":
@@ -78,7 +96,8 @@ class LeanTheorem:
             name=data.get("name"),
         )
         for block_data in data["by_blocks"]:
-            if block_data.get("error") is not None:
+            if "tree" not in block_data:
+                # Legacy format: bare StoredError in by_blocks
                 by_blocks.append(StoredError.deserialize(block_data))
             else:
                 by_blocks.append(LeanTacticBlock.deserialize(block_data, thm))
@@ -94,11 +113,23 @@ class LeanFile:
     theorems: list[LeanTheorem | StoredError]
     relative_path: Path | None = None
 
+    @staticmethod
+    def _serialize_theorem(t) -> dict:
+        if isinstance(t, StoredError):
+            return {
+                "span": None,
+                "by_blocks": [],
+                "context": [],
+                "name": None,
+                "error": t.error,
+            }
+        return t.serialize()
+
     def serialize(self) -> dict:
         return {
             "path": str(self.relative_path or self.path),
             "imports": self.imports,
-            "theorems": [t.serialize() for t in self.theorems]
+            "theorems": [self._serialize_theorem(t) for t in self.theorems]
         }
 
     @classmethod
@@ -110,9 +141,9 @@ class LeanFile:
             theorems=theorems,
         )
         for thm_data in data["theorems"]:
-            # TODO: error should never be empty when it's non-None
-            if thm_data.get("error") is not None:
-                theorems.append(StoredError.deserialize(thm_data))
+            error = thm_data.get("error")
+            if error is not None:
+                theorems.append(StoredError(error))
             else:
                 theorems.append(LeanTheorem.deserialize(thm_data, file))
         return file
