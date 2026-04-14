@@ -1,6 +1,7 @@
 import argparse
 import itertools
 import json
+import multiprocessing as mp
 import sys
 from collections import defaultdict
 import traceback
@@ -50,8 +51,11 @@ def create_parser():
     generate.add_argument("--force", action="store_true", help="Override the output file if it already exists.")
     generate.add_argument("--use_repl_cache", action="store_true")
 
-    generate.add_argument("--total_workers", type=int)
-    generate.add_argument("--worker_id", type=int)
+    generate.add_argument("--num_workers", type=int, default=1,
+                          help="Number of parallel worker processes (work-stealing).")
+    # For SLURM/multi-node: static sharding
+    generate.add_argument("--total_workers", type=int, help="[Advanced] Total shards across nodes.")
+    generate.add_argument("--worker_id", type=int, help="[Advanced] Shard ID for this invocation.")
 
     view_trees.add_argument("dataset_path", type=Path)
     view_trees.add_argument("--limit", type=int, default=100)
@@ -109,11 +113,12 @@ def generate_dataset(args: argparse.Namespace):
         include_time=False,
         include_slurm_id=False,
     )
-    if args.worker_id is None:
-        args.worker_id = 0
-        args.total_workers = 1
 
-    out_file = args.output_dir / f"leantree-{descriptor}-{args.worker_id}.jsonl"
+    # Shard suffix for multi-node setups; default single shard.
+    shard_id = args.worker_id if args.worker_id is not None else 0
+    total_shards = args.total_workers if args.total_workers is not None else 1
+
+    out_file = args.output_dir / f"leantree-{descriptor}-{shard_id}.jsonl"
     if not args.force:
         if out_file.exists():
             print(f"Exiting because output file already exists: {out_file}")
@@ -125,26 +130,110 @@ def generate_dataset(args: argparse.Namespace):
 
     source_files_path = args.project_path / ".lake/packages" / args.source_files
     print(f"Identifying Lean files: {source_files_path}")
-    paths = identify_lean_files(args, source_files_path)
-    paths = list(paths)
-    batch_size = len(paths) // args.total_workers
-    offset = args.worker_id * batch_size
-    # Last worker picks up remainder files
-    end = offset + batch_size if args.worker_id < args.total_workers - 1 else len(paths)
-    paths = paths[offset:end]
-    print(
-        f"Will process {len(paths)} paths (worker {args.worker_id} of {args.total_workers}, files {offset} - {offset + len(paths)})."
-    )
+    paths = list(identify_lean_files(args, source_files_path))
+
+    if total_shards > 1:
+        batch_size = len(paths) // total_shards
+        offset = shard_id * batch_size
+        end = offset + batch_size if shard_id < total_shards - 1 else len(paths)
+        paths = paths[offset:end]
+        print(f"Shard {shard_id}/{total_shards}: processing {len(paths)} files (offset {offset})")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Output path: {out_file}")
+    print(f"Output: {out_file}")
+    print(f"Workers: {args.num_workers}")
 
-    generator = DatasetGenerator(
-        args,
-        out_file,
-        errors_file,
+    if args.num_workers <= 1:
+        # Sequential mode (legacy)
+        generator = DatasetGenerator(args, out_file, errors_file)
+        generator.generate(paths)
+    else:
+        _generate_parallel(args, paths, out_file, errors_file)
+
+
+# ----- Parallel worker pool -----
+
+# Per-worker cached project (initialized lazily).
+_WORKER_PROJECT = None
+
+
+def _worker_init(project_path: str, repl_path: str):
+    """Runs once per worker process to initialize the LeanProject."""
+    global _WORKER_PROJECT
+    logger = utils.Logger(utils.LogLevel.SUPPRESS)
+    _WORKER_PROJECT = LeanProject(Path(project_path), repl_path=Path(repl_path), logger=logger)
+
+
+def _worker_process_file(task):
+    """Process a single file in a worker. Returns (path, main_line, err_lines, exc)."""
+    path_str, use_cache = task
+    path = Path(path_str)
+    try:
+        loaded = _WORKER_PROJECT.load_file(path, use_cache=use_cache)
+    except Exception:
+        return path_str, None, [], traceback.format_exc()
+
+    main_line = json.dumps(loaded.serialize(), ensure_ascii=False)
+    err_lines = []
+    total_thms = len(loaded.theorems)
+    good_thms = 0
+    good_blocks = 0
+    for thm in loaded.theorems:
+        if isinstance(thm, StoredError):
+            err_lines.append(json.dumps(thm.serialize(), ensure_ascii=False))
+        else:
+            good_thms += 1
+            for by_block in thm.by_blocks:
+                if isinstance(by_block.tree, StoredError):
+                    err_lines.append(json.dumps(by_block.tree.serialize(), ensure_ascii=False))
+                else:
+                    good_blocks += 1
+    return path_str, main_line, err_lines, None, (total_thms, good_thms, good_blocks)
+
+
+def _generate_parallel(args, paths: list[Path], out_file: Path, errors_file: Path):
+    tasks = [(str(p.absolute()), args.use_repl_cache) for p in paths]
+
+    total_thms = 0
+    good_thms = 0
+    good_blocks = 0
+    failed_files = 0
+
+    # spawn is safer than fork for this complex codebase
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(
+        args.num_workers,
+        initializer=_worker_init,
+        initargs=(str(args.project_path), str(args.repl_path)),
+    ) as pool, open(out_file, "w") as fo, open(errors_file, "w") as fe:
+        pbar = tqdm(total=len(tasks), desc=f"[{args.num_workers} workers]", unit="file")
+        for result in pool.imap_unordered(_worker_process_file, tasks):
+            path_str, main_line, err_lines, exc, *rest = result
+            if main_line is None:
+                failed_files += 1
+                tqdm.write(f"FAILED: {path_str}\n{exc}", file=sys.stderr)
+            else:
+                fo.write(main_line + "\n")
+                fo.flush()
+                for el in err_lines:
+                    fe.write(el + "\n")
+                fe.flush()
+                t, gt, gb = rest[0]
+                total_thms += t
+                good_thms += gt
+                good_blocks += gb
+            pbar.set_postfix(
+                thms=f"{good_thms}/{total_thms}",
+                blocks=good_blocks,
+                failed=failed_files,
+            )
+            pbar.update(1)
+        pbar.close()
+
+    print(
+        f"\nDone. {len(tasks)} files, {failed_files} failed. "
+        f"Theorems: {good_thms}/{total_thms}. Blocks: {good_blocks}."
     )
-    generator.generate(paths)
 
 
 class DatasetGenerator:

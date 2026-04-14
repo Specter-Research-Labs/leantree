@@ -1,4 +1,3 @@
-import traceback
 from typing import Self
 import shutil
 import subprocess
@@ -79,7 +78,6 @@ class LeanProject:
                 for tree in unit.trees:
                     ProofTreePostprocessor.transform_proof_tree(tree)
             except (AssertionError, LeanInteractionException) as e:
-                traceback.print_exc()
                 if store_assertion_errors:
                     unit.trees = e
                     continue
