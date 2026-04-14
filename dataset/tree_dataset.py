@@ -2,6 +2,7 @@ import argparse
 import itertools
 import json
 import multiprocessing as mp
+import signal
 import sys
 from collections import defaultdict
 import traceback
@@ -53,6 +54,9 @@ def create_parser():
 
     generate.add_argument("--num_workers", type=int, default=1,
                           help="Number of parallel worker processes (work-stealing).")
+    generate.add_argument("--file_timeout", type=int, default=1800,
+                          help="Per-file processing timeout in seconds (default 1800 = 30 min). "
+                               "Files exceeding this limit are recorded as errors.")
     # For SLURM/multi-node: static sharding
     generate.add_argument("--total_workers", type=int, help="[Advanced] Total shards across nodes.")
     generate.add_argument("--worker_id", type=int, help="[Advanced] Shard ID for this invocation.")
@@ -164,14 +168,45 @@ def _worker_init(project_path: str, repl_path: str):
     _WORKER_PROJECT = LeanProject(Path(project_path), repl_path=Path(repl_path), logger=logger)
 
 
+class _FileTimeout(Exception):
+    pass
+
+
+def _relative_to_packages(project_path: Path, file_path: Path) -> Path:
+    packages_dir = project_path / ".lake" / "packages"
+    if file_path.is_relative_to(packages_dir):
+        return file_path.relative_to(packages_dir)
+    return file_path
+
+
+def _crashed_file_entry(project_path: Path, file_path: Path, error_msg: str) -> str:
+    """Build a JSONL entry for a file that crashed during processing."""
+    return json.dumps({
+        "path": str(_relative_to_packages(project_path, file_path)),
+        "imports": [],
+        "theorems": [],
+        "error": error_msg,
+    }, ensure_ascii=False)
+
+
 def _worker_process_file(task):
-    """Process a single file in a worker. Returns (path, main_line, err_lines, exc)."""
-    path_str, use_cache = task
+    """Process a single file in a worker. Returns (path, main_line, err_lines, exc, stats)."""
+    path_str, use_cache, timeout_sec = task
     path = Path(path_str)
+
+    def _alarm(signum, frame):
+        raise _FileTimeout(f"Per-file timeout of {timeout_sec}s exceeded")
+
+    if timeout_sec and timeout_sec > 0:
+        signal.signal(signal.SIGALRM, _alarm)
+        signal.alarm(timeout_sec)
     try:
         loaded = _WORKER_PROJECT.load_file(path, use_cache=use_cache)
     except Exception:
-        return path_str, None, [], traceback.format_exc()
+        signal.alarm(0)
+        return path_str, None, [], traceback.format_exc(), None
+    finally:
+        signal.alarm(0)
 
     main_line = json.dumps(loaded.serialize(), ensure_ascii=False)
     err_lines = []
@@ -192,7 +227,7 @@ def _worker_process_file(task):
 
 
 def _generate_parallel(args, paths: list[Path], out_file: Path, errors_file: Path):
-    tasks = [(str(p.absolute()), args.use_repl_cache) for p in paths]
+    tasks = [(str(p.absolute()), args.use_repl_cache, args.file_timeout) for p in paths]
 
     total_thms = 0
     good_thms = 0
@@ -212,6 +247,10 @@ def _generate_parallel(args, paths: list[Path], out_file: Path, errors_file: Pat
             if main_line is None:
                 failed_files += 1
                 tqdm.write(f"FAILED: {path_str}\n{exc}", file=sys.stderr)
+                # Still record the file with an error so it appears in the dataset.
+                crashed_line = _crashed_file_entry(args.project_path, Path(path_str), exc or "Unknown error")
+                fo.write(crashed_line + "\n")
+                fo.flush()
             else:
                 fo.write(main_line + "\n")
                 fo.flush()
@@ -254,9 +293,17 @@ class DatasetGenerator:
     def generate(self, paths: list[Path]):
         total_files = 0
         failed_files = 0
+        timeout = getattr(self.args, "file_timeout", 0)
         for i, path in enumerate(paths):
             print(f"Processing [{i + 1}/{len(paths)}]: {path}")
             total_files += 1
+
+            def _alarm(_signum, _frame):
+                raise _FileTimeout(f"Per-file timeout of {timeout}s exceeded")
+
+            if timeout and timeout > 0:
+                signal.signal(signal.SIGALRM, _alarm)
+                signal.alarm(timeout)
             # noinspection PyBroadException
             try:
                 loaded_file = self.load_file(path.absolute())
@@ -264,7 +311,12 @@ class DatasetGenerator:
             except Exception:
                 failed_files += 1
                 print(f"Failed file: {path}", file=sys.stderr)
+                err_msg = traceback.format_exc()
                 traceback.print_exc()
+                with open(self.out_path, "a") as f:
+                    f.write(_crashed_file_entry(self.args.project_path, path.absolute(), err_msg) + "\n")
+            finally:
+                signal.alarm(0)
 
             print(self.get_stats())
             print(f"Failed files: {failed_files} / {total_files} ({failed_files / total_files:%})")
