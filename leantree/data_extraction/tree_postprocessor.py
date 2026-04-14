@@ -68,14 +68,12 @@ class ProofTreePostprocessor:
         else:
             return
 
-        if constructors is None:
-            # BetterParser already decomposed the alternatives into separate steps.
+        if constructors is None or len(constructors) != len(node.tactic.spawned_goals):
+            # Either inductionAlts not found, or BetterParser already decomposed the
+            # alternatives into separate steps (so spawned_goals is empty/mismatched).
             # Just trim the "with ..." suffix from the tactic string.
             node.tactic.tactic_string = match.group(1).rstrip()
             return
-
-        assert len(constructors) == len(node.tactic.spawned_goals),\
-            "Different number of constructors and spawned goal for cases/induction."
         intermezzo_nodes = []
         for constructor, child in zip(constructors, node.tactic.spawned_goals):
             # We do not want to synthesize the state before the renaming of constructor variables, so we leave that to
@@ -167,29 +165,24 @@ class ProofTreePostprocessor:
         )
         if alts_node is None:
             return None
-        assert (
-            len(alts_node.args) >= 3 and
-            alts_node.args[0].pretty_print() == "with"
-        ), f"Unexpected inductionAlts structure: {[a.pretty_print() if hasattr(a, 'pretty_print') else str(a) for a in alts_node.args[:3]]}"
-
+        # Structure can vary — return None if unexpected so caller can skip transform.
+        if len(alts_node.args) < 3 or alts_node.args[0].pretty_print() != "with":
+            return None
         alts = alts_node.args[2]
-        assert isinstance(alts, LeanASTArray), (
-            f"Expected array of alternatives, got {type(alts).__name__}"
-        )
+        if not isinstance(alts, LeanASTArray):
+            return None
 
         constructors = []
         for alt in alts.items:
-            assert (
-                isinstance(alt, LeanASTObject) and
-                alt.type == "Tactic.inductionAlt"
-            ), f"Expected Tactic.inductionAlt, got {alt.type if isinstance(alt, LeanASTObject) else type(alt).__name__}"
-            assert len(alt.args) >= 3 and alt.args[1].pretty_print() == "=>", (
-                f"Unexpected inductionAlt structure"
-            )
-            constructor_tokens = alt.args[0].get_tokens()
-            assert constructor_tokens[0] == "|", (
-                f"Expected '|' token, got '{constructor_tokens[0]}'"
-            )
+            if not (isinstance(alt, LeanASTObject) and alt.type == "Tactic.inductionAlt"):
+                return None
+            # The expected structure is [LHS, "=>", body]; some variants have only [LHS, body].
+            if len(alt.args) < 1:
+                return None
+            lhs = alt.args[0]
+            constructor_tokens = lhs.get_tokens()
+            if not constructor_tokens or constructor_tokens[0] != "|":
+                return None
             constructor = " ".join(constructor_tokens[1:])
             constructors.append(constructor)
         return constructors
