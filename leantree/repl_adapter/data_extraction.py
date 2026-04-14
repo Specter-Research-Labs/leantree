@@ -180,7 +180,7 @@ class GlobalContextTracker:
         self.sections_stack = [GlobalContextTracker.Section("")]
 
     def next_compilation_unit(self, source: str):
-        context_clauses = ["open "]
+        context_clauses = ["open ", "universe ", "universes ", "variable ", "variables "]
         section_clauses = ["section", "noncomputable section", "namespace "]
         if any(source.startswith(c) for c in context_clauses):
             assert "\n\n" not in source
