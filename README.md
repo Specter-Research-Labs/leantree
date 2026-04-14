@@ -136,10 +136,34 @@ with project.environment() as env:
 
 ## Datasets
 
-Assuming you have already create a Lean project in `leantree_project`, you can recreate the whole Mathlib dataset by running:
+Assuming you have already created a Lean project in `leantree_project`, you can recreate the whole Mathlib dataset by running:
 
 ```bash
-python dataset/tree_dataset.py generate --project_path leantree_project --source_files mathlib/Mathlib
+python dataset/tree_dataset.py generate \
+  --project_path leantree_project \
+  --source_files mathlib/Mathlib \
+  --output_dir leantree_generated \
+  --num_workers 16
+```
+
+This uses a work-stealing pool of 16 worker processes and shows a live `tqdm` progress bar with running totals of extracted theorems, blocks, and failures. The default `--num_workers 1` runs sequentially.
+
+For multi-node setups (e.g. SLURM array jobs), each node can process a disjoint shard:
+
+```bash
+python dataset/tree_dataset.py generate \
+  --project_path leantree_project \
+  --source_files mathlib/Mathlib \
+  --total_workers $SLURM_ARRAY_TASK_COUNT \
+  --worker_id $SLURM_ARRAY_TASK_ID \
+  --num_workers 16
+```
+
+After all shards finish, merge them:
+
+```bash
+python dataset/tree_dataset.py merge_shards leantree_generated \
+  --output_dir leantree_merged --shards_count $SLURM_ARRAY_TASK_COUNT
 ```
 
 ## Development
