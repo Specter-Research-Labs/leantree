@@ -87,7 +87,11 @@ class PickledEnv:
 
 
 # TODO: maybe replace with `print axioms` to also catch `apply?`/`admit`
-_eq_sorry_pattern = re.compile(r'\b:=\s*sorry\b')
+# Matches `:= sorry` / `:=\n  sorry` so we can rewrite it to `:= by sorry`.
+# The `:=` is always preceded by whitespace in normal sources, so no `\b`
+# prefix (which only fires between word/non-word chars and thus silently
+# failed to match in the presence of that leading space).
+_eq_sorry_pattern = re.compile(r':=\s*sorry\b')
 
 
 class LeanProcess:
@@ -305,7 +309,16 @@ class LeanProcess:
 
         response = await self._send_to_repl_async(data)
 
-        assert "env" in response, f"no `env` in REPL response with keys: {response.keys()}"
+        if "env" not in response:
+            # REPL returned a fatal error without advancing the environment.
+            # Typical cause: a parse or elaboration failure severe enough that
+            # no new env snapshot was produced. Surface the payload as a
+            # LeanInteractionException so callers (e.g., proof_from_sorry)
+            # can report it cleanly instead of asserting.
+            message = response.get("message")
+            raise LeanInteractionException(
+                f"No `env` in REPL response. message={message!r} response={response!r}"
+            )
         self._env_id = response["env"]
         return response
 
