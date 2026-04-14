@@ -120,7 +120,6 @@ class SingletonTreeBuilder:
     @classmethod
     def _check_if_unit_supported(cls, unit: ReplCompilationUnit):
         unsupported_tactics = [
-            "calc",
             "conv",
         ]
         for tactic in unsupported_tactics:
