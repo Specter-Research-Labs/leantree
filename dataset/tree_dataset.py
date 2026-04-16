@@ -204,9 +204,11 @@ def _worker_process_file(task):
         loaded = _WORKER_PROJECT.load_file(path, use_cache=use_cache)
     except Exception:
         signal.alarm(0)
+        signal.signal(signal.SIGALRM, signal.SIG_DFL)
         return path_str, None, [], traceback.format_exc(), None
     finally:
         signal.alarm(0)
+        signal.signal(signal.SIGALRM, signal.SIG_DFL)
 
     main_line = json.dumps(loaded.serialize(), ensure_ascii=False)
     err_lines = []
@@ -317,6 +319,7 @@ class DatasetGenerator:
                     f.write(_crashed_file_entry(self.args.project_path, path.absolute(), err_msg) + "\n")
             finally:
                 signal.alarm(0)
+                signal.signal(signal.SIGALRM, signal.SIG_DFL)
 
             print(self.get_stats())
             print(f"Failed files: {failed_files} / {total_files} ({failed_files / total_files:%})")

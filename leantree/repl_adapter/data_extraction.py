@@ -178,28 +178,59 @@ class GlobalContextTracker:
 
     def __init__(self):
         self.sections_stack = [GlobalContextTracker.Section("")]
+        # Set to True when the tracker observes a statement it cannot parse into its
+        # stack model. Once poisoned, `get_context` returns None so downstream consumers
+        # know the context for this and subsequent units is unreliable.
+        self.poisoned = False
+        self.poison_reason: str | None = None
+
+    def _poison(self, reason: str):
+        self.poisoned = True
+        self.poison_reason = reason
 
     def next_compilation_unit(self, source: str):
+        if self.poisoned:
+            return
         context_clauses = ["open ", "universe ", "universes ", "variable ", "variables "]
         section_clauses = ["section", "noncomputable section", "namespace "]
         if any(source.startswith(c) for c in context_clauses):
-            assert "\n\n" not in source
+            if "\n\n" in source:
+                self._poison(f"context clause contains blank line: {source!r}")
+                return
             self.sections_stack[-1].context.append(source)
         elif any(source.startswith(c) for c in section_clauses):
-            assert "\n" not in source
+            if "\n" in source:
+                self._poison(f"section/namespace spans multiple lines: {source!r}")
+                return
             clause = next(c for c in section_clauses if source.startswith(c))
             section = source[len(clause):].strip()
-            assert " " not in section
+            if " " in section:
+                self._poison(f"section/namespace name contains whitespace: {source!r}")
+                return
             for part in section.split("."):
                 self.sections_stack.append(GlobalContextTracker.Section(part))
         elif source.startswith("end"):
-            assert "\n" not in source
+            if "\n" in source:
+                self._poison(f"`end` spans multiple lines: {source!r}")
+                return
             section = source[len("end"):].strip()
-            assert " " not in section
-            for part in reversed(section.split(".")):
-                assert part == "" or part == self.sections_stack[-1].name
-                assert len(self.sections_stack) > 1
+            if " " in section:
+                self._poison(f"`end` name contains whitespace: {source!r}")
+                return
+            parts = list(reversed(section.split(".")))
+            # Validate before mutating, so a failed `end` leaves the stack intact.
+            if len(self.sections_stack) - 1 < len(parts):
+                self._poison(f"`end` without matching section: {source!r}")
+                return
+            for offset, part in enumerate(parts):
+                expected = self.sections_stack[-1 - offset].name
+                if part != "" and part != expected:
+                    self._poison(f"`end {section}` does not match open section {expected!r}")
+                    return
+            for _ in parts:
                 self.sections_stack.pop()
 
-    def get_context(self) -> list[str]:
+    def get_context(self) -> list[str] | None:
+        if self.poisoned:
+            return None
         return [ctx for section in self.sections_stack for ctx in section.context]

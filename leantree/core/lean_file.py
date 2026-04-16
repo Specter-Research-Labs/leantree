@@ -63,8 +63,9 @@ class LeanTheorem:
     # Single theorem can contain multiple `by` clauses.
     by_blocks: list[LeanTacticBlock]
 
-    # Can contain clauses `open` (including `hiding`, `renaming`, etc.), `variable`, `universe`
-    context: list[str]
+    # Can contain clauses `open` (including `hiding`, `renaming`, etc.), `variable`, `universe`.
+    # None when the global-context tracker could not follow the file's section/namespace structure.
+    context: list[str] | None
     name: str | None = None
 
     @staticmethod

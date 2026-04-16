@@ -409,7 +409,12 @@ class LeanProcess:
                 yield unit.theorem, sorry_branches
                 continue
             if unit.theorem is not None:
-                assert len(sorry_branches) == len(unit.theorem.by_blocks)
+                if len(sorry_branches) != len(unit.theorem.by_blocks):
+                    yield unit.theorem, Exception(
+                        f"Mismatch between REPL sorry branches ({len(sorry_branches)}) "
+                        f"and tree-builder by-blocks ({len(unit.theorem.by_blocks)})."
+                    )
+                    continue
                 yield unit.theorem, sorry_branches
 
     file_proofs = to_sync_iterator(file_proofs_async)
