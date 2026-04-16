@@ -16,7 +16,10 @@ class ProofTreePostprocessor:
 
             # Note: the order is important here, because tacticStrings are being modified.
             cls._replace_nested_tactics_with_sorries(node)
-            cls._remove_by_sorry_in_have(node)
+            # _remove_by_sorry_in_have is disabled: in Lean 4.27+, bodyless `have h : T`
+            # (without `:= by sorry`) is no longer valid tactic syntax.  Keeping the
+            # `:= by sorry` body works correctly — the REPL creates a sorry branch that
+            # the tree builder matches to the spawned_goals child.
             cls._transform_with_cases(node)
             cls._transform_case_tactic(node)
             cls._transform_simp_rw(node)
