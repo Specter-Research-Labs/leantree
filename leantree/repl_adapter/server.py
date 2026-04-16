@@ -511,7 +511,7 @@ class LeanClient:
         self.port = port
         self.base_url = f"http://{address}:{port}"
 
-    def _request(self, method: str, path: str, data: dict = None) -> dict:
+    def _request(self, method: str, path: str, data: dict = None, timeout: float | None = None) -> dict:
         """Make an HTTP request to the server."""
         url = f"{self.base_url}{path}"
         if data is not None:
@@ -522,7 +522,8 @@ class LeanClient:
             req = urllib.request.Request(url, method=method)
 
         try:
-            with urllib.request.urlopen(req) as response:
+            kwargs = {"timeout": timeout} if timeout is not None else {}
+            with urllib.request.urlopen(req, **kwargs) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             error_body = e.read().decode("utf-8")
@@ -553,7 +554,11 @@ class LeanClient:
         data = {"blocking": blocking}
         if timeout is not None:
             data["timeout"] = timeout
-        response = self._request("POST", "/process/get", data)
+        # Socket timeout slightly exceeds server-side timeout to allow the
+        # server to respond with "no process available" rather than the socket
+        # timing out first.  +30s gives headroom for server-side bookkeeping.
+        socket_timeout = timeout + 30.0 if timeout is not None else None
+        response = self._request("POST", "/process/get", data, timeout=socket_timeout)
         process_id = response.get("process_id")
         if process_id is None:
             return None

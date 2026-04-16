@@ -120,7 +120,13 @@ class ProofTreeBuilder:
             assert goal is None or goal.mvar_id is not None
             tactic_info = expansion_node.tactic
 
-            if expansion_idx == 0 or re.match(r"^case'? ", tactic_info.tactic_string):
+            is_case_selector = re.match(r"^case'? ", tactic_info.tactic_string) and " => " not in tactic_info.tactic_string
+            if is_case_selector:
+                # In Lean 4.27+, standalone `case tag` is invalid; must use `case tag => body`.
+                # We send `case tag => sorry` which focuses the goal, sorrys it (creating a
+                # sorry branch for child verification), and advances the main proof state.
+                tactic = f"{tactic_info.tactic_string} => sorry"
+            elif expansion_idx == 0 or re.match(r"^case'? ", tactic_info.tactic_string):
                 # The goal is the main goal or the tactic already selects the goal using `case` / `case'`.
                 tactic = tactic_info.tactic_string
             elif (
@@ -137,8 +143,14 @@ class ProofTreeBuilder:
             sub_branches = branch.apply_tactic(tactic)
 
             src_siblings = [src_nodes[i] for i in range(len(src_nodes)) if i != expansion_idx]
-            # Note that the order here is important and reflects behavior of the REPL.
-            src_all_children = expansion_node.tactic.goals_after + expansion_node.tactic.spawned_goals + src_siblings
+            if is_case_selector:
+                # `case tag => sorry` returns [regular_branches (siblings), sorry_branch (case goal)].
+                # Reorder src_all_children so siblings come first (matching regular branches),
+                # then spawned_goals (matching the sorry branch).
+                src_all_children = src_siblings + expansion_node.tactic.goals_after + expansion_node.tactic.spawned_goals
+            else:
+                # Note that the order here is important and reflects behavior of the REPL.
+                src_all_children = expansion_node.tactic.goals_after + expansion_node.tactic.spawned_goals + src_siblings
 
             children = []
             for sub_branch in sub_branches:
