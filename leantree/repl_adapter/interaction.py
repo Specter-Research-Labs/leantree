@@ -366,12 +366,12 @@ class LeanProcess:
 
     def _assert_started(self):
         if self._proc is None:
-            raise Exception(
+            raise LeanProcessException(
                 "Subprocess not started. Use 'with LeanProcess(...) as env:' or 'async with LeanProcess(...) as env:'"
             )
         if self._proc.returncode is not None:
             stderr_tail = "\n".join(self._stderr_buffer)
-            raise Exception(
+            raise LeanProcessException(
                 f"Subprocess has terminated with exit code {self._proc.returncode}.\n"
                 f"Stderr output:\n{stderr_tail}\n"
                 "Use 'with LeanProcess(...) as env:' or 'async with LeanProcess(...) as env:'"
