@@ -610,7 +610,7 @@ class LeanProofBranch(ProofBranch[LeanGoal, LeanTactic]):
     def is_solved(self) -> bool:
         return self.state.is_solved()
 
-    async def _send_tactic_async(self, tactic: str, timeout: int | None = 1000) -> dict:
+    async def _send_tactic_async(self, tactic: str, timeout: int | None = 5000) -> dict:
         data = {
             "tactic": tactic,
             "proofState": self._proof_state_id,
@@ -676,7 +676,7 @@ class LeanProofBranch(ProofBranch[LeanGoal, LeanTactic]):
             # example : 1 = 0 := by
             #   apply?
             ban_search_tactics: bool = True,
-            timeout: int | None = 1000,
+            timeout: int | None = 5000,
     ) -> list[Self]:
         assert not self.state.is_solved(), "This proof branch is already solved."
         if isinstance(tactic, LeanTactic):
@@ -723,7 +723,7 @@ class LeanProofBranch(ProofBranch[LeanGoal, LeanTactic]):
 
     # TODO: def apply_tactics
 
-    async def try_apply_tactic_async(self, tactic: LeanTactic | str, timeout: int | None = 1000) -> ValueOrError[list[Self]]:
+    async def try_apply_tactic_async(self, tactic: LeanTactic | str, timeout: int | None = 5000) -> ValueOrError[list[Self]]:
         try:
             return ValueOrError.from_success(await self.apply_tactic_async(tactic, timeout=timeout))
         except (LeanInteractionException, AssertionError) as e:
