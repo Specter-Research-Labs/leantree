@@ -418,6 +418,10 @@ class LeanServer:
                         self._send_json(200, {"error": "No sorries found in theorem"})
                         return
 
+                    if len(proof_branches) > 1:
+                        self._send_json(200, {"error": f"Expected 1 sorry, found {len(proof_branches)}"})
+                        return
+
                     proof_branch = proof_branches[0]
                     # Register the branch so we can use it later
                     branch_id = server._register_branch(process_id, proof_branch)
