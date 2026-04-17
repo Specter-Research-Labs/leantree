@@ -145,6 +145,14 @@ class ProofTreePostprocessor:
                 replacement="sorry",
                 spans=sub_spans,
             )
+            # In Lean 4.27+, `simpa` (and potentially others) reject bare `sorry`
+            # in term arguments but accept `by sorry`.  When the replaced span
+            # includes the `by` keyword, replacement produces bare `sorry` where
+            # `by sorry` was expected.  Fix up by replacing bare `sorry` (not
+            # already preceded by `by`) with `by sorry`.
+            new_tactic = re.sub(r'(?<!by )(?<!by)sorry', 'by sorry', new_tactic)
+            # Clean up any double `by` from cases where `by` was outside the span.
+            new_tactic = new_tactic.replace('by by sorry', 'by sorry')
             node.tactic.tactic_string = new_tactic
 
     @classmethod
