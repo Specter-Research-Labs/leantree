@@ -213,8 +213,14 @@ class LeanProcess:
     def rollback_to(self, checkpoint: LeanEnvironmentCheckpoint):
         self._env_id = checkpoint.env_id
 
-    async def _send_to_repl_async(self, data: dict) -> dict:
-        """Send data to the REPL asynchronously and return the response."""
+    async def _send_to_repl_async(self, data: dict, timeout: float | None = 300) -> dict:
+        """Send data to the REPL asynchronously and return the response.
+
+        Args:
+            data: JSON-serializable dict to send to the REPL.
+            timeout: Maximum seconds to wait for a complete response.
+                     ``None`` means no limit.
+        """
         self._assert_started()
         serialized = json.dumps(data, ensure_ascii=False) + "\n\n"
 
@@ -224,17 +230,26 @@ class LeanProcess:
             await self._proc.stdin.drain()
 
             response_lines = []
-            while True:
-                line = await self._proc.stdout.readline()
-                if not line:
-                    # EOF.
-                    raise LeanProcessException("Lean REPL process ended unexpectedly")
 
-                decoded_line = line.decode('utf-8')
-                if decoded_line.strip() == "":
-                    # Empty line marks end of response.
-                    break
-                response_lines.append(decoded_line)
+            async def _read_response():
+                while True:
+                    line = await self._proc.stdout.readline()
+                    if not line:
+                        raise LeanProcessException("Lean REPL process ended unexpectedly")
+                    decoded_line = line.decode('utf-8')
+                    if decoded_line.strip() == "":
+                        break
+                    response_lines.append(decoded_line)
+
+            if timeout is not None:
+                try:
+                    await asyncio.wait_for(_read_response(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    raise LeanProcessException(
+                        f"Lean REPL did not respond within {timeout}s"
+                    )
+            else:
+                await _read_response()
         except (BrokenPipeError, ValueError, OSError) as e:
             raise LeanProcessException(f"Failed to send data to REPL: {e}") from e
 

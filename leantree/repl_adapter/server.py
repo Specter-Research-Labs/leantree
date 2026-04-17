@@ -12,7 +12,7 @@ import urllib.error
 
 import psutil
 
-from leantree.repl_adapter.interaction import LeanProcess, LeanProofBranch, LeanInteractionException
+from leantree.repl_adapter.interaction import LeanProcess, LeanProcessException, LeanProofBranch, LeanInteractionException
 from leantree.repl_adapter.process_pool import LeanProcessPool
 from leantree.core.lean import LeanProofState, LeanTactic, LeanGoal
 from leantree.utils import serialize_exception, deserialize_exception, ValueOrError
@@ -98,6 +98,32 @@ class LeanServer:
             self._process_last_used.pop(process_id, None)
         # Also clean up any branches associated with this process
         self._remove_branches_for_process(process_id)
+
+    def _destroy_process(self, process_id: int):
+        """Kill a process and remove it from tracking.
+
+        Used when a REPL timeout or crash leaves the process in an
+        undefined state and it cannot be safely returned to the pool.
+        """
+        with self._lock:
+            process = self._process_id_to_process.pop(process_id, None)
+            if process is not None and process in self._process_to_id:
+                del self._process_to_id[process]
+            self._process_last_used.pop(process_id, None)
+        self._remove_branches_for_process(process_id)
+        if process is not None:
+            try:
+                self._run_async(process.stop_async_safe())
+            except Exception as e:
+                self.logger.warning(f"Error stopping poisoned process {process_id}: {e}")
+            # Decrement pool's used count so a replacement can be created.
+            async def _release_slot():
+                async with self.pool.lock:
+                    if self.pool._num_used_processes > 0:
+                        self.pool._num_used_processes -= 1
+                    self.pool.process_available_event.set()
+            self._run_async(_release_slot())
+            self.logger.warning(f"Destroyed poisoned process {process_id}")
 
     def _register_branch(self, process_id: int, branch: LeanProofBranch) -> int:
         """Register a branch and return its ID."""
@@ -360,6 +386,9 @@ class LeanServer:
 
                     response = server._run_async(process.send_command_async(command))
                     self._send_json(200, response)
+                except LeanProcessException as e:
+                    server._destroy_process(process_id)
+                    self._send_error(500, str(e), exception=e)
                 except Exception as e:
                     self._send_error(500, str(e), exception=e)
 
@@ -371,6 +400,9 @@ class LeanServer:
 
                     is_valid = server._run_async(process.is_valid_source_async(source))
                     self._send_json(200, {"is_valid": is_valid})
+                except LeanProcessException as e:
+                    server._destroy_process(process_id)
+                    self._send_error(500, str(e), exception=e)
                 except Exception as e:
                     self._send_error(500, str(e), exception=e)
 
@@ -432,6 +464,9 @@ class LeanServer:
                         "goals": goals,
                     }
                     self._send_json(200, {"value": response})
+                except LeanProcessException as e:
+                    server._destroy_process(process_id)
+                    self._send_error(500, str(e), exception=e)
                 except Exception as e:
                     self._send_error(500, str(e), exception=e)
 
@@ -461,6 +496,9 @@ class LeanServer:
                         })
 
                     self._send_json(200, {"value": branches_data})
+                except LeanProcessException as e:
+                    server._destroy_process(process_id)
+                    self._send_error(500, str(e), exception=e)
                 except Exception as e:
                     self._send_error(500, str(e), exception=e)
 
@@ -515,8 +553,15 @@ class LeanClient:
         self.port = port
         self.base_url = f"http://{address}:{port}"
 
-    def _request(self, method: str, path: str, data: dict = None, timeout: float | None = None) -> dict:
-        """Make an HTTP request to the server."""
+    def _request(self, method: str, path: str, data: dict = None, timeout: float | None = 360) -> dict:
+        """Make an HTTP request to the server.
+
+        Args:
+            timeout: Socket timeout in seconds.  Defaults to 360s (slightly
+                     above the server-side 300s REPL timeout so the server has
+                     a chance to respond with an error first).  Pass ``None``
+                     to wait indefinitely.
+        """
         url = f"{self.base_url}{path}"
         if data is not None:
             data_bytes = json.dumps(data).encode("utf-8")
@@ -539,6 +584,8 @@ class LeanClient:
                 raise deserialize_exception(error_data, f"Error from LeanServer: {error_message}")
             except json.JSONDecodeError:
                 raise RuntimeError(f"Error from LeanServer: {str(e)}")
+        except urllib.error.URLError as e:
+            raise ConnectionError(f"LeanServer request to {path} failed: {e}") from e
 
     def check_status(self) -> dict:
         """Check the status of the server."""
