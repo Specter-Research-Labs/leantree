@@ -7,7 +7,7 @@ from leantree.core.proof_tree import ProofTree, ProofTreeNode, ProofTreeEdge
 from leantree.file_span import FilePosition
 from leantree.repl_adapter.data import ReplLoadedLeanFile, SingletonProofTree, SingletonProofTreeNode, \
     ReplCompilationUnit
-from leantree.repl_adapter.interaction import LeanProofBranch, LeanProcess
+from leantree.repl_adapter.interaction import LeanProofBranch, LeanProcess, LeanInteractionException
 from leantree.utils import get_source_with_sorries, replace_with_sorries
 
 
@@ -140,7 +140,15 @@ class ProofTreeBuilder:
                 # Here we could do rotate_left or pick_goal.
                 raise AssertionError("Applying tactic to a non-main unnamed goal is not yet supported.")
 
-            sub_branches = branch.apply_tactic(tactic)
+            try:
+                sub_branches = branch.apply_tactic(tactic)
+            except LeanInteractionException as e:
+                if "No goals" in str(e):
+                    # The goal was already closed by a prior tactic — this step is
+                    # redundant.  Treat as success with no remaining goals.
+                    sub_branches = []
+                else:
+                    raise
 
             src_siblings = [src_nodes[i] for i in range(len(src_nodes)) if i != expansion_idx]
             if is_case_selector:

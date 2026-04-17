@@ -145,6 +145,11 @@ class ProofTreePostprocessor:
                 replacement="sorry",
                 spans=sub_spans,
             )
+            # In Lean 4.27+, `simpa` rejects bare `sorry` in its arguments but
+            # accepts `by sorry`.  Apply a targeted fix only for simpa tactics.
+            if new_tactic.lstrip().startswith("simpa"):
+                new_tactic = re.sub(r'(?<!\bby )(?<!\bby\n)sorry', 'by sorry', new_tactic)
+                new_tactic = re.sub(r'by\s+by sorry', 'by sorry', new_tactic)
             node.tactic.tactic_string = new_tactic
 
     @classmethod
