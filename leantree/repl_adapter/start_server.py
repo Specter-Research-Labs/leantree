@@ -90,6 +90,12 @@ def main():
         action="store_true",
         help="Pre-start all processes to max capacity before accepting requests"
     )
+    parser.add_argument(
+        "--warmup-batch-size",
+        type=int,
+        default=None,
+        help="Start warmup processes in batches of this size to limit resource contention (default: all at once)"
+    )
 
     args = parser.parse_args()
 
@@ -146,8 +152,12 @@ def main():
 
     # Warmup: pre-start all processes if requested (must be after server starts to use its event loop)
     if args.warmup:
-        print(f"Warming up {args.max_processes} processes...")
-        server._run_async(pool.max_out_processes_async())
+        batch_size = args.warmup_batch_size
+        if batch_size:
+            print(f"Warming up {args.max_processes} processes in batches of {batch_size}...")
+        else:
+            print(f"Warming up {args.max_processes} processes...")
+        server._run_async(pool.max_out_processes_async(batch_size=batch_size))
         print("Warmup complete.")
     print(f"Lean project: {project_path}")
     print(f"REPL executable: {repl_exe}")
