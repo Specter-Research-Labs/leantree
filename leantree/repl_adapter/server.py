@@ -734,7 +734,8 @@ class LeanRemoteProcess:
             return self.client._request(
                 "POST",
                 f"/process/{self.process_id}/command",
-                {"command": command}
+                {"command": command},
+                timeout=360,
             )
 
     def is_valid_source(self, source: str) -> bool:
@@ -744,7 +745,8 @@ class LeanRemoteProcess:
             response = self.client._request(
                 "POST",
                 f"/process/{self.process_id}/is_valid_source",
-                {"source": source}
+                {"source": source},
+                timeout=60,
             )
             return response["is_valid"]
 
@@ -763,7 +765,7 @@ class LeanRemoteProcess:
         last_error = None
         for attempt in range(max_retries):
             try:
-                self.client._request("POST", f"/process/{self.process_id}/return")
+                self.client._request("POST", f"/process/{self.process_id}/return", timeout=10)
                 with self._lock:
                     self._returned = True
                 return
@@ -786,7 +788,8 @@ class LeanRemoteProcess:
             response = self.client._request(
                 "POST",
                 f"/process/{self.process_id}/proof_from_sorry",
-                {"theorem_with_sorry": theorem_with_sorry}
+                {"theorem_with_sorry": theorem_with_sorry},
+                timeout=60,
             )
 
         if "error" in response:
@@ -852,10 +855,14 @@ class RemoteLeanProofBranch:
         if timeout is not None:
             data["timeout"] = timeout
 
+        # Socket timeout: tactic timeout (ms->s) + 30s headroom for server overhead.
+        # Prevents actors from blocking for 360s on an unresponsive server.
+        socket_timeout = (timeout / 1000 if timeout else 300) + 30
         response = self.client._request(
             "POST",
             f"/process/{self.process_id}/branch/{self._branch_id}/try_apply_tactic",
-            data
+            data,
+            timeout=socket_timeout,
         )
 
         if "error" in response:
