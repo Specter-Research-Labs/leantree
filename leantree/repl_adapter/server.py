@@ -65,6 +65,11 @@ class LeanServer:
         self._request_id_counter = 0
         self._requests_lock = threading.Lock()
 
+        # Lease timeout: processes not used for this long are assumed leaked
+        # and returned to the pool automatically.
+        self._process_lease_timeout = 600.0  # 10 minutes
+        self._reaper_thread = None
+
     def _get_process_id(self, process: LeanProcess) -> int:
         """Get or create a process ID for a LeanProcess."""
         with self._lock:
@@ -195,6 +200,48 @@ class LeanServer:
                 for rid, info in self._active_requests.items()
             ]
 
+    def _reap_leaked_processes(self):
+        """Periodically reclaim processes whose clients have disappeared.
+
+        A process is considered leaked when it has been checked out (present in
+        ``_process_id_to_process``) but not touched for longer than
+        ``_process_lease_timeout`` seconds AND there is no active HTTP request
+        referencing it.
+        """
+        while True:
+            time.sleep(60)
+            now = time.time()
+            to_reclaim = []
+            with self._lock:
+                for pid, last_used in list(self._process_last_used.items()):
+                    if now - last_used > self._process_lease_timeout:
+                        to_reclaim.append(pid)
+            for pid in to_reclaim:
+                # Check there is no active request for this process (e.g.
+                # a long-running tactic application).
+                with self._requests_lock:
+                    active_for_pid = any(
+                        f"/process/{pid}/" in req["path"]
+                        for req in self._active_requests.values()
+                    )
+                if active_for_pid:
+                    continue
+                self.logger.warning(
+                    f"Reclaiming leaked process {pid} (unused for "
+                    f">{self._process_lease_timeout}s)"
+                )
+                with self._lock:
+                    process = self._process_id_to_process.pop(pid, None)
+                    if process is not None and process in self._process_to_id:
+                        del self._process_to_id[process]
+                    self._process_last_used.pop(pid, None)
+                self._remove_branches_for_process(pid)
+                if process is not None:
+                    try:
+                        self._run_async(self.pool.return_process_async(process))
+                    except Exception as e:
+                        self.logger.error(f"Error returning leaked process {pid}: {e}")
+
     def start(self):
         """Start the HTTP server."""
         if self.server is not None:
@@ -221,6 +268,12 @@ class LeanServer:
 
         self.server_thread = threading.Thread(target=run_server, daemon=True)
         self.server_thread.start()
+
+        # Start the lease-timeout reaper to reclaim leaked processes
+        self._reaper_thread = threading.Thread(
+            target=self._reap_leaked_processes, daemon=True
+        )
+        self._reaper_thread.start()
 
     def stop(self):
         """Stop the HTTP server."""
@@ -586,6 +639,9 @@ class LeanClient:
                 raise RuntimeError(f"Error from LeanServer: {str(e)}")
         except urllib.error.URLError as e:
             raise ConnectionError(f"LeanServer request to {path} failed: {e}") from e
+        except TimeoutError as e:
+            # Socket-level timeouts during response reading may bypass URLError
+            raise ConnectionError(f"LeanServer request to {path} timed out: {e}") from e
 
     def check_status(self) -> dict:
         """Check the status of the server."""
@@ -630,20 +686,22 @@ class LeanRemoteProcess:
 
     def __exit__(self, *args, **kwargs):
         """Return the process to the pool when exiting context."""
-        self.return_process()
-    
+        try:
+            self.return_process()
+        except Exception:
+            # Don't mask the original exception (if any) with a return failure.
+            # return_process already retries internally, so if we get here the
+            # server is likely unreachable.
+            logging.getLogger("LeanClient").warning(
+                f"Failed to return process {self.process_id} in __exit__"
+            )
+
     def __del__(self):
-        """Best-effort cleanup: try to return the process if not already returned.
-        
-        Note: This is a fallback. Users should prefer using the context manager
-        or explicitly calling return_process() for reliable cleanup.
-        """
+        """Best-effort cleanup: try to return the process if not already returned."""
         if not self._returned:
             try:
                 self.return_process()
             except Exception:
-                # Ignore errors during garbage collection - the server's lease
-                # timeout will eventually reclaim the process anyway
                 pass
 
     def _check_not_returned(self):
@@ -673,13 +731,35 @@ class LeanRemoteProcess:
             return response["is_valid"]
 
     def return_process(self):
-        """Return the process to the pool. Safe to call multiple times."""
+        """Return the process to the pool. Safe to call multiple times.
+
+        Retries up to 3 times to avoid leaking processes on the server when
+        the network is transiently unreachable.
+        """
         with self._lock:
             if self._returned:
                 return  # Already returned, nothing to do
+        # Send the return request outside the lock to avoid holding it during I/O.
+        # Only mark _returned=True on success to allow retries from __exit__/__del__.
+        max_retries = 3
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                self.client._request("POST", f"/process/{self.process_id}/return")
+                with self._lock:
+                    self._returned = True
+                return
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    time.sleep(0.5 * (attempt + 1))
+        # All retries exhausted - mark as returned to prevent infinite retries,
+        # but log the leak.  The process will be stuck on the server.
+        with self._lock:
             self._returned = True
-        # Send the return request outside the lock to avoid holding it during I/O
-        self.client._request("POST", f"/process/{self.process_id}/return")
+        logging.getLogger("LeanClient").error(
+            f"Failed to return process {self.process_id} after {max_retries} attempts: {last_error}"
+        )
 
     def proof_from_sorry(self, theorem_with_sorry: str) -> ValueOrError["RemoteLeanProofBranch"]:
         """Create a proof branch from a theorem with sorry."""
