@@ -276,7 +276,25 @@ class LeanServer:
         self._reaper_thread.start()
 
     def stop(self):
-        """Stop the HTTP server."""
+        """Stop the HTTP server and all Lean processes (both idle and checked-out)."""
+        # First, stop checked-out processes that the pool doesn't track.
+        # Must happen while the event loop is still running.
+        if self._event_loop is not None:
+            with self._lock:
+                checked_out = list(self._process_id_to_process.values())
+                self._process_id_to_process.clear()
+                self._process_to_id.clear()
+                self._process_last_used.clear()
+            for process in checked_out:
+                try:
+                    self._run_async(process.stop_async_safe())
+                except Exception as e:
+                    self.logger.warning(f"Error stopping checked-out process: {e}")
+            # Shut down the pool (stops idle/available processes)
+            try:
+                self._run_async(self.pool.shutdown_async())
+            except Exception as e:
+                self.logger.warning(f"Error shutting down pool: {e}")
         if self.server is not None:
             self.server.shutdown()
             self.server = None

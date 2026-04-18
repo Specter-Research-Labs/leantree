@@ -176,9 +176,7 @@ def main():
             os._exit(1)
         _shutting_down = True
         print("\nShutting down server... (press Ctrl+C again to force quit)")
-        # Shut down pool on the server's event loop before stopping it
-        # (pool's asyncio primitives are bound to that loop)
-        server._run_async(pool.shutdown_async())
+        # server.stop() handles both checked-out and idle processes
         server.stop()
         # Restore terminal settings (input() in keyboard_monitor can leave terminal in bad state)
         _restore_terminal()
