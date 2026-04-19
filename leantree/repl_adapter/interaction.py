@@ -105,6 +105,13 @@ class LeanProcess:
         self._env_id = None
         self._stderr_buffer = deque(maxlen=50)
         self._stderr_task = None
+        # Serializes _send_to_repl_async calls so two coroutines on the same
+        # event loop can't interleave a write/read pair against the same
+        # subprocess (which corrupts the StreamReader state and surfaces as
+        # `RuntimeError: readuntil() called while another coroutine is
+        # already waiting for incoming data`).  Created lazily because some
+        # Python versions tie the lock to the running event loop.
+        self._io_lock = None
 
     async def _monitor_stderr(self):
         """Read stderr in the background and buffer the last few lines."""
@@ -220,38 +227,81 @@ class LeanProcess:
             data: JSON-serializable dict to send to the REPL.
             timeout: Maximum seconds to wait for a complete response.
                      ``None`` means no limit.
+
+        Implementation note — timeout is enforced by SIGKILL-on-deadline,
+        not ``asyncio.wait_for``.  Cancelling a task that's parked inside
+        ``StreamReader.readline()`` does NOT reliably reset the reader's
+        internal ``_waiter`` (CPython issue 30289).  In practice this means
+        a single timed-out read corrupts the stream so that the next read
+        on the same process raises
+        ``RuntimeError: readuntil() called while another coroutine is
+        already waiting for incoming data``.  When that propagates out of
+        a leanserver request handler it deadlocks the asyncio event loop,
+        and the whole leanserver eventually stops answering HTTP.
+
+        Killing the subprocess on deadline avoids the race entirely:
+        ``readline()`` cleanly returns ``b""`` (EOF), the inner loop
+        below converts that to a ``LeanProcessException``, and we re-tag
+        it with the timeout message.  The poisoned process is then torn
+        down by the pool's existing logic.
         """
         self._assert_started()
         serialized = json.dumps(data, ensure_ascii=False) + "\n\n"
 
         self.logger.debug(f"Sending to REPL: '{serialized[:-2]}'")
-        try:
-            self._proc.stdin.write(serialized.encode('utf-8'))
-            await self._proc.stdin.drain()
 
-            response_lines = []
+        if self._io_lock is None:
+            self._io_lock = asyncio.Lock()
 
-            async def _read_response():
-                while True:
-                    line = await self._proc.stdout.readline()
-                    if not line:
-                        raise LeanProcessException("Lean REPL process ended unexpectedly")
-                    decoded_line = line.decode('utf-8')
-                    if decoded_line.strip() == "":
-                        break
-                    response_lines.append(decoded_line)
+        response_lines = []
+        timed_out = False
+        timeout_handle = None
 
-            if timeout is not None:
+        def _on_timeout():
+            nonlocal timed_out
+            timed_out = True
+            try:
+                self._proc.kill()
+            except (ProcessLookupError, AttributeError):
+                pass
+
+        async def _read_response():
+            while True:
+                line = await self._proc.stdout.readline()
+                if not line:
+                    raise LeanProcessException("Lean REPL process ended unexpectedly")
+                decoded_line = line.decode('utf-8')
+                if decoded_line.strip() == "":
+                    break
+                response_lines.append(decoded_line)
+
+        async with self._io_lock:
+            try:
+                self._proc.stdin.write(serialized.encode('utf-8'))
+                await self._proc.stdin.drain()
+
+                if timeout is not None:
+                    timeout_handle = asyncio.get_event_loop().call_later(timeout, _on_timeout)
                 try:
-                    await asyncio.wait_for(_read_response(), timeout=timeout)
-                except asyncio.TimeoutError:
+                    await _read_response()
+                finally:
+                    if timeout_handle is not None:
+                        timeout_handle.cancel()
+                if timed_out:
+                    # Race: read returned cleanly but the watchdog had already
+                    # fired and killed the process.  Surface the timeout, the
+                    # response we just read is from a soon-to-be-dead process.
                     raise LeanProcessException(
                         f"Lean REPL did not respond within {timeout}s"
                     )
-            else:
-                await _read_response()
-        except (BrokenPipeError, ValueError, OSError) as e:
-            raise LeanProcessException(f"Failed to send data to REPL: {e}") from e
+            except LeanProcessException:
+                if timed_out:
+                    raise LeanProcessException(
+                        f"Lean REPL did not respond within {timeout}s"
+                    )
+                raise
+            except (BrokenPipeError, ValueError, OSError) as e:
+                raise LeanProcessException(f"Failed to send data to REPL: {e}") from e
 
         response_str = "".join(response_lines)
         self._log_repl_response(response_str)
