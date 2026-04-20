@@ -2,7 +2,10 @@
 
 import argparse
 import atexit
+import faulthandler
+import logging
 import os
+import resource
 import signal
 import sys
 import termios
@@ -12,6 +15,36 @@ from pathlib import Path
 from leantree.repl_adapter.server import start_server, LeanClient
 from leantree.repl_adapter.process_pool import LeanProcessPool
 from leantree.utils import Logger, LogLevel
+
+
+# Default soft limit for open file descriptors.  The OS default of 1024 is too
+# tight for ~62 lake/repl subprocesses + ~125 concurrent HTTP clients + their
+# transient TIME_WAIT sockets.  We've observed FD exhaustion (Errno 24) at
+# 1024 in production; 65536 leaves headroom for >5x the steady-state load.
+DEFAULT_NOFILE_SOFT_LIMIT = 65536
+
+
+def _raise_nofile_soft_limit(target: int = DEFAULT_NOFILE_SOFT_LIMIT) -> None:
+    """Raise RLIMIT_NOFILE up to ``min(target, current_hard_limit)``.
+
+    No-op on platforms without the resource module (e.g. Windows).
+    Logs the before/after values so the actual limit is visible at startup.
+    """
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (AttributeError, ValueError, OSError) as e:
+        print(f"Could not query RLIMIT_NOFILE: {e}", file=sys.stderr)
+        return
+    new_soft = min(target, hard)
+    if new_soft <= soft:
+        print(f"RLIMIT_NOFILE soft limit already at {soft} (>= requested {target}); leaving as-is")
+        return
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
+    except (ValueError, OSError) as e:
+        print(f"Could not raise RLIMIT_NOFILE from {soft} to {new_soft}: {e}", file=sys.stderr)
+        return
+    print(f"Raised RLIMIT_NOFILE soft limit from {soft} to {new_soft} (hard={hard})")
 
 # Terminal settings preservation
 # ----------------------------
@@ -96,8 +129,34 @@ def main():
         default=None,
         help="Start warmup processes in batches of this size to limit resource contention (default: all at once)"
     )
+    parser.add_argument(
+        "--max-process-memory-gb",
+        type=float,
+        default=8.0,
+        help=(
+            "Per-Lean-subprocess RLIMIT_AS in GiB (default: 8). When a tactic's "
+            "address space exceeds this, the kernel SIGKILLs the subprocess "
+            "cleanly; the pool's existing poisoned-process logic swaps in a "
+            "fresh one. 0 disables the limit (not recommended in production)."
+        )
+    )
 
     args = parser.parse_args()
+
+    # FD limit must be raised BEFORE the HTTP socket is opened or any subprocess
+    # is spawned, so do it as early as possible after argparse.
+    _raise_nofile_soft_limit()
+
+    # Make `kill -USR1 <pid>` dump a Python traceback for every thread to
+    # stderr.  Pure diagnostic surface — does not affect normal operation.  The
+    # bounded `_run_async` timeouts in server.py mean the leanserver shouldn't
+    # actually wedge in production, but if it ever does this is how we learn
+    # what's stuck without having to attach gdb.
+    try:
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+        print("Registered SIGUSR1 handler: kill -USR1 <pid> dumps all-thread tracebacks to stderr")
+    except (AttributeError, ValueError, OSError) as e:
+        print(f"Could not register SIGUSR1 faulthandler: {e}", file=sys.stderr)
 
     # Determine repl_exe path
     if args.repl_exe:
@@ -134,12 +193,24 @@ def main():
             await process.send_command_async(imports_str)
         env_setup_async = setup_imports
 
+    max_process_memory_bytes = (
+        int(args.max_process_memory_gb * 1024 ** 3) if args.max_process_memory_gb > 0 else None
+    )
+    if max_process_memory_bytes is not None:
+        print(
+            f"Per-process RLIMIT_AS: {args.max_process_memory_gb} GiB "
+            f"({max_process_memory_bytes} bytes) — runaway tactics will be SIGKILLed by the kernel"
+        )
+    else:
+        print("Per-process RLIMIT_AS: DISABLED (--max-process-memory-gb=0)")
+
     pool = LeanProcessPool(
         repl_exe=repl_exe,
         project_path=project_path,
         max_processes=args.max_processes,
         logger=Logger(LogLevel.DEBUG) if args.log_level == "DEBUG" else None,
         env_setup_async=env_setup_async,
+        max_process_memory_bytes=max_process_memory_bytes,
     )
 
     # Start server

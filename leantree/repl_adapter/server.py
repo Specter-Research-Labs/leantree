@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import json
 import logging
 import threading
@@ -16,6 +17,28 @@ from leantree.repl_adapter.interaction import LeanProcess, LeanProcessException,
 from leantree.repl_adapter.process_pool import LeanProcessPool
 from leantree.core.lean import LeanProofState, LeanTactic, LeanGoal
 from leantree.utils import serialize_exception, deserialize_exception, ValueOrError
+
+
+# Hard deadlines for every cross-thread await-on-the-event-loop call.
+# Without these, one stuck coroutine can block an HTTP handler thread forever,
+# queueing every subsequent request behind it until the server appears dead
+# (observed in production, see plan `the-fix-2-is-streamed-valiant.md`).
+# These wrap the *inner* async operation's own timeout with a small headroom,
+# so the server-side `_run_async` never waits longer than the coroutine itself
+# promised to take.
+RUN_ASYNC_HEADROOM = 30.0  # seconds — wraps caller-supplied operation timeouts
+STOP_ASYNC_TIMEOUT = 10.0  # bounded wait in stop_async is already 5s (D1); +5s headroom
+RELEASE_SLOT_TIMEOUT = 5.0  # trivial bookkeeping coro
+RETURN_PROCESS_TIMEOUT = 30.0  # drain_repl_output is near-instant; 30s is generous
+POOL_SHUTDOWN_TIMEOUT = 30.0
+
+# Default per-operation deadlines used when the caller didn't specify one.
+# Each of these is an inner (coro-level) deadline; add RUN_ASYNC_HEADROOM
+# when passing to _run_async.
+DEFAULT_COMMAND_TIMEOUT = 300.0  # matches _send_to_repl_async default
+DEFAULT_PROOF_FROM_SORRY_TIMEOUT = 300.0
+DEFAULT_IS_VALID_SOURCE_TIMEOUT = 60.0
+DEFAULT_TRY_APPLY_TACTIC_MS = 1000  # matches existing handler default
 
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
@@ -109,26 +132,48 @@ class LeanServer:
 
         Used when a REPL timeout or crash leaves the process in an
         undefined state and it cannot be safely returned to the pool.
+
+        Note (A2): the slow `_run_async` calls below MUST happen *outside*
+        ``self._lock``.  Holding the server-wide lock while waiting on the
+        asyncio loop would freeze every other handler that needs the lock
+        (status, get_process_id, return_process, ...) if the loop ever
+        slows down — which is exactly the cascading-deadlock failure mode
+        we're fixing.
         """
+        # Step 1: snapshot + drop the lock as fast as possible.
         with self._lock:
             process = self._process_id_to_process.pop(process_id, None)
             if process is not None and process in self._process_to_id:
                 del self._process_to_id[process]
             self._process_last_used.pop(process_id, None)
         self._remove_branches_for_process(process_id)
-        if process is not None:
-            try:
-                self._run_async(process.stop_async_safe())
-            except Exception as e:
-                self.logger.warning(f"Error stopping poisoned process {process_id}: {e}")
-            # Decrement pool's used count so a replacement can be created.
-            async def _release_slot():
-                async with self.pool.lock:
-                    if self.pool._num_used_processes > 0:
-                        self.pool._num_used_processes -= 1
-                    self.pool.process_available_event.set()
-            self._run_async(_release_slot())
-            self.logger.warning(f"Destroyed poisoned process {process_id}")
+        if process is None:
+            return
+
+        # Step 2: cross the loop boundary with the lock released.
+        try:
+            self._run_async(process.stop_async_safe(), timeout=STOP_ASYNC_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            self.logger.error(
+                f"stop_async_safe for poisoned process {process_id} did not complete in "
+                f"{STOP_ASYNC_TIMEOUT}s — leaking the subprocess to avoid blocking the loop"
+            )
+        except Exception as e:
+            self.logger.warning(f"Error stopping poisoned process {process_id}: {e}")
+        # Decrement pool's used count so a replacement can be created.
+        async def _release_slot():
+            async with self.pool.lock:
+                if self.pool._num_used_processes > 0:
+                    self.pool._num_used_processes -= 1
+                self.pool.process_available_event.set()
+        try:
+            self._run_async(_release_slot(), timeout=RELEASE_SLOT_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            self.logger.error(
+                f"_release_slot for poisoned process {process_id} did not complete in "
+                f"{RELEASE_SLOT_TIMEOUT}s — pool slot accounting may drift"
+            )
+        self.logger.warning(f"Destroyed poisoned process {process_id}")
 
     def _register_branch(self, process_id: int, branch: LeanProofBranch) -> int:
         """Register a branch and return its ID."""
@@ -238,7 +283,15 @@ class LeanServer:
                 self._remove_branches_for_process(pid)
                 if process is not None:
                     try:
-                        self._run_async(self.pool.return_process_async(process))
+                        self._run_async(
+                            self.pool.return_process_async(process),
+                            timeout=RETURN_PROCESS_TIMEOUT,
+                        )
+                    except concurrent.futures.TimeoutError:
+                        self.logger.error(
+                            f"return_process_async for leaked process {pid} did not complete in "
+                            f"{RETURN_PROCESS_TIMEOUT}s — leaking the subprocess to avoid blocking the reaper"
+                        )
                     except Exception as e:
                         self.logger.error(f"Error returning leaked process {pid}: {e}")
 
@@ -287,12 +340,18 @@ class LeanServer:
                 self._process_last_used.clear()
             for process in checked_out:
                 try:
-                    self._run_async(process.stop_async_safe())
+                    self._run_async(process.stop_async_safe(), timeout=STOP_ASYNC_TIMEOUT)
+                except concurrent.futures.TimeoutError:
+                    self.logger.warning(
+                        f"stop_async_safe did not complete in {STOP_ASYNC_TIMEOUT}s during shutdown"
+                    )
                 except Exception as e:
                     self.logger.warning(f"Error stopping checked-out process: {e}")
             # Shut down the pool (stops idle/available processes)
             try:
-                self._run_async(self.pool.shutdown_async())
+                self._run_async(self.pool.shutdown_async(), timeout=POOL_SHUTDOWN_TIMEOUT)
+            except concurrent.futures.TimeoutError:
+                self.logger.warning(f"pool.shutdown_async did not complete in {POOL_SHUTDOWN_TIMEOUT}s")
             except Exception as e:
                 self.logger.warning(f"Error shutting down pool: {e}")
         if self.server is not None:
@@ -428,12 +487,21 @@ class LeanServer:
                 process = None
                 process_id = None
                 try:
-                    process = server._run_async(server.pool.get_process_async(blocking=blocking, timeout=timeout))
+                    process = server._run_async(
+                        server.pool.get_process_async(blocking=blocking, timeout=timeout),
+                        timeout=timeout + RUN_ASYNC_HEADROOM,
+                    )
                     if process is None:
                         self._send_json(200, {"process_id": None})
                     else:
                         process_id = server._get_process_id(process)
                         self._send_json(200, {"process_id": process_id})
+                except concurrent.futures.TimeoutError:
+                    server.logger.error(
+                        f"get_process_async exceeded {timeout + RUN_ASYNC_HEADROOM}s on the event loop — "
+                        f"loop is unresponsive (send SIGUSR1 for a thread dump)"
+                    )
+                    self._send_error(503, "leanserver event loop is unresponsive")
                 except BrokenPipeError:
                     # Client disconnected - return the process to the pool if we got one
                     if process is not None:
@@ -442,7 +510,15 @@ class LeanServer:
                         )
                         server._remove_process(process_id)
                         try:
-                            server._run_async(server.pool.return_process_async(process))
+                            server._run_async(
+                                server.pool.return_process_async(process),
+                                timeout=RETURN_PROCESS_TIMEOUT,
+                            )
+                        except concurrent.futures.TimeoutError:
+                            server.logger.error(
+                                f"return_process_async after client disconnect did not complete in "
+                                f"{RETURN_PROCESS_TIMEOUT}s"
+                            )
                         except Exception as e:
                             server.logger.error(f"Error returning process after client disconnect: {e}")
                     raise  # Re-raise to let the server handle the broken connection
@@ -455,8 +531,18 @@ class LeanServer:
                     data = self._read_json()
                     command = data["command"]
 
-                    response = server._run_async(process.send_command_async(command))
+                    response = server._run_async(
+                        process.send_command_async(command),
+                        timeout=DEFAULT_COMMAND_TIMEOUT + RUN_ASYNC_HEADROOM,
+                    )
                     self._send_json(200, response)
+                except concurrent.futures.TimeoutError:
+                    server.logger.error(
+                        f"send_command_async on process {process_id} did not complete in "
+                        f"{DEFAULT_COMMAND_TIMEOUT + RUN_ASYNC_HEADROOM}s — destroying process"
+                    )
+                    server._destroy_process(process_id)
+                    self._send_error(503, "leanserver event loop did not respond in time")
                 except LeanProcessException as e:
                     server._destroy_process(process_id)
                     self._send_error(500, str(e), exception=e)
@@ -469,8 +555,18 @@ class LeanServer:
                     data = self._read_json()
                     source = data["source"]
 
-                    is_valid = server._run_async(process.is_valid_source_async(source))
+                    is_valid = server._run_async(
+                        process.is_valid_source_async(source),
+                        timeout=DEFAULT_IS_VALID_SOURCE_TIMEOUT + RUN_ASYNC_HEADROOM,
+                    )
                     self._send_json(200, {"is_valid": is_valid})
+                except concurrent.futures.TimeoutError:
+                    server.logger.error(
+                        f"is_valid_source_async on process {process_id} did not complete in "
+                        f"{DEFAULT_IS_VALID_SOURCE_TIMEOUT + RUN_ASYNC_HEADROOM}s — destroying process"
+                    )
+                    server._destroy_process(process_id)
+                    self._send_error(503, "leanserver event loop did not respond in time")
                 except LeanProcessException as e:
                     server._destroy_process(process_id)
                     self._send_error(500, str(e), exception=e)
@@ -478,6 +574,10 @@ class LeanServer:
                     self._send_error(500, str(e), exception=e)
 
             def _handle_return_process(self, process_id: int):
+                # A2: snapshot under the lock, then drop it before crossing into the
+                # event loop.  The original code held server._lock through _run_async,
+                # which froze every other handler whenever the loop slowed down.
+                process = None
                 try:
                     with server._lock:
                         if process_id not in server._process_id_to_process:
@@ -495,8 +595,17 @@ class LeanServer:
                     # Clean up any branches associated with this process
                     server._remove_branches_for_process(process_id)
                     # Now return to pool - any new client will get a fresh ID
-                    server._run_async(server.pool.return_process_async(process))
+                    server._run_async(
+                        server.pool.return_process_async(process),
+                        timeout=RETURN_PROCESS_TIMEOUT,
+                    )
                     self._send_json(200, {"status": "ok"})
+                except concurrent.futures.TimeoutError:
+                    server.logger.error(
+                        f"return_process_async for process {process_id} did not complete in "
+                        f"{RETURN_PROCESS_TIMEOUT}s — process will be reaped as leaked"
+                    )
+                    self._send_error(503, "leanserver event loop did not respond in time")
                 except Exception as e:
                     self._send_error(500, str(e), exception=e)
 
@@ -512,7 +621,18 @@ class LeanServer:
                         return [branch async for branch in process.proofs_from_sorries_async(theorem_with_sorry)]
 
                     try:
-                        proof_branches = server._run_async(collect_proof_branches())
+                        proof_branches = server._run_async(
+                            collect_proof_branches(),
+                            timeout=DEFAULT_PROOF_FROM_SORRY_TIMEOUT + RUN_ASYNC_HEADROOM,
+                        )
+                    except concurrent.futures.TimeoutError:
+                        server.logger.error(
+                            f"proof_from_sorry on process {process_id} did not complete in "
+                            f"{DEFAULT_PROOF_FROM_SORRY_TIMEOUT + RUN_ASYNC_HEADROOM}s — destroying process"
+                        )
+                        server._destroy_process(process_id)
+                        self._send_error(503, "leanserver event loop did not respond in time")
+                        return
                     except LeanInteractionException as e:
                         self._send_json(200, {"error": str(e)})
                         return
@@ -546,10 +666,15 @@ class LeanServer:
                     branch = server._get_branch(process_id, branch_id)
                     data = self._read_json()
                     tactic = data["tactic"]
-                    timeout = data.get("timeout", 1000)
+                    timeout = data.get("timeout", DEFAULT_TRY_APPLY_TACTIC_MS)
 
+                    # tactic timeout is in milliseconds; convert + add headroom for the
+                    # _run_async deadline so the inner asyncio op gets to enforce its own
+                    # SIGKILL-on-deadline first.
+                    run_async_timeout = (timeout / 1000.0) + RUN_ASYNC_HEADROOM
                     result = server._run_async(
-                        branch.try_apply_tactic_async(tactic, timeout=timeout)
+                        branch.try_apply_tactic_async(tactic, timeout=timeout),
+                        timeout=run_async_timeout,
                     )
 
                     if not result.is_success():
@@ -567,6 +692,13 @@ class LeanServer:
                         })
 
                     self._send_json(200, {"value": branches_data})
+                except concurrent.futures.TimeoutError:
+                    server.logger.error(
+                        f"try_apply_tactic on process {process_id}/branch {branch_id} did not complete in "
+                        f"{run_async_timeout}s — destroying process"
+                    )
+                    server._destroy_process(process_id)
+                    self._send_error(503, "leanserver event loop did not respond in time")
                 except LeanProcessException as e:
                     server._destroy_process(process_id)
                     self._send_error(500, str(e), exception=e)

@@ -24,6 +24,7 @@ class LeanProcessPool:
             max_memory_utilization: float = 80.0,  # percentage
             env_setup_async: Callable[[LeanProcess], Coroutine] | None = None,
             logger: Logger | None = None,
+            max_process_memory_bytes: int | None = None,
     ):
         """
         Initialize the process pool.
@@ -32,13 +33,24 @@ class LeanProcessPool:
             repl_exe: Path to the Lean REPL executable
             project_path: Path to the Lean project
             max_processes: Maximum number of parallel processes
-            max_memory_utilization: Maximum memory utilization as a percentage
+            max_memory_utilization: Maximum memory utilization as a percentage,
+                used by the legacy on-return memory check.  Largely superseded
+                by ``max_process_memory_bytes`` which is enforced by the kernel
+                via RLIMIT_AS at subprocess creation, but kept as a soft check
+                for hosts that don't enforce the kernel limit.
+            max_process_memory_bytes: Hard per-Lean-subprocess address-space
+                ceiling enforced by ``RLIMIT_AS`` set in a ``preexec_fn``.
+                A pathological tactic that exceeds this gets SIGKILLed by the
+                kernel and surfaces as a clean ``LeanProcessException`` —
+                which the leanserver's poisoned-process path then handles by
+                replacing the dead process.  ``None`` disables the limit.
             logger: Optional logger
         """
         self.repl_exe = repl_exe
         self.project_path = project_path
         self.max_processes = max_processes
         self.max_memory_utilization = max_memory_utilization
+        self.max_process_memory_bytes = max_process_memory_bytes
         self.logger = logger if logger else NullLogger()
 
         # Pool state
@@ -50,7 +62,9 @@ class LeanProcessPool:
         self._lock: asyncio.Lock | None = None
         self._process_available_event: asyncio.Event | None = None
         self.env_setup_async = env_setup_async
-        # Calculate memory threshold per server based on total system memory
+        # Calculate memory threshold per server based on total system memory.
+        # This is the *legacy* on-return PSS check; the new RLIMIT_AS
+        # enforcement (max_process_memory_bytes) is the primary safety net.
         total_memory = psutil.virtual_memory().total
         self.memory_threshold_per_process = int(total_memory * (self.max_memory_utilization / 100) / self.max_processes)
 
@@ -84,6 +98,7 @@ class LeanProcessPool:
                 self.project_path,
                 self.logger,
                 pool=self,
+                max_memory_bytes=self.max_process_memory_bytes,
             )
             await process.start_async()
             if self.env_setup_async:
@@ -236,13 +251,19 @@ class LeanProcessPool:
             process: The LeanProcess instance to return
         """
 
-        # Check memory and do slow cleanup OUTSIDE the lock
+        # Check shutdown OUTSIDE the lock; if the host enforces RLIMIT_AS via
+        # the preexec_fn (the new default), pathological-memory subprocesses
+        # already get SIGKILLed by the kernel as soon as they balloon — no
+        # need to re-measure PSS on return, and trying to do so for an already-
+        # killed process raises spuriously.  When `max_process_memory_bytes`
+        # is None (legacy/disabled) we still fall back to the PSS check.
         should_terminate = False
         async with self.lock:
             if self._was_shutdown:
                 should_terminate = True
 
-        if not should_terminate:
+        kernel_enforced_memory_limit = self.max_process_memory_bytes is not None
+        if not should_terminate and not kernel_enforced_memory_limit:
             try:
                 memory_usage = process.memory_usage()
                 if self.memory_threshold_per_process and memory_usage > self.memory_threshold_per_process:

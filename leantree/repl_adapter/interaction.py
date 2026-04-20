@@ -1,6 +1,10 @@
 import asyncio
+import ctypes
+import ctypes.util
 import json
 import re
+import resource
+import signal
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
@@ -10,6 +14,58 @@ from typing import Self, Any, AsyncIterator
 import psutil
 
 from leantree import utils
+
+
+# Linux prctl numbers (from <sys/prctl.h>) — used to make lake/repl children
+# die immediately when their parent (the leanserver Python process) dies,
+# eliminating orphan processes after a crash or `kill -9`.
+_PR_SET_PDEATHSIG = 1
+
+
+def _make_subprocess_preexec_fn(max_memory_bytes: int | None):
+    """Build a preexec_fn that hardens each lake/repl child subprocess.
+
+    Runs in the *child* between fork() and execve() so the limits apply to the
+    Lean subprocess (and propagate via execve to its lake/lean grandchildren).
+
+    - ``RLIMIT_AS = max_memory_bytes`` (when set): a runaway tactic that
+      blows past this gets SIGKILLed cleanly by the kernel; the parent sees
+      EOF on the REPL pipes and surfaces a normal ``LeanProcessException``.
+      Without this, a single bad tactic can grow to 100+ GB and OOM-kill
+      the whole leanserver Python process (observed in production).
+    - ``prctl(PR_SET_PDEATHSIG, SIGKILL)``: when the parent process exits
+      for any reason (including SIGKILL by the OOM killer), the kernel
+      immediately sends SIGKILL to this child.  Eliminates the orphaned-
+      lake/repl-process problem we've been cleaning up by hand.
+    """
+    libc_path = ctypes.util.find_library("c") or "libc.so.6"
+    try:
+        _libc = ctypes.CDLL(libc_path, use_errno=True)
+    except OSError:
+        _libc = None
+
+    def _preexec():
+        # Address-space ceiling.  Setting both soft and hard prevents the child
+        # itself from raising it later.  Wrap in try/except so a non-Linux
+        # platform (where RLIMIT_AS is unavailable / works differently) doesn't
+        # take down subprocess creation.
+        if max_memory_bytes is not None:
+            try:
+                resource.setrlimit(
+                    resource.RLIMIT_AS, (max_memory_bytes, max_memory_bytes)
+                )
+            except (ValueError, OSError):
+                pass
+        # Parent-death signal: SIGKILL when leanserver Python process exits.
+        # Linux-only; harmless no-op elsewhere because libc.prctl will just
+        # error out and we swallow it.
+        if _libc is not None:
+            try:
+                _libc.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+            except (AttributeError, OSError):
+                pass
+
+    return _preexec
 from leantree.core.abstraction import ProofBranch
 from leantree.core.lean import LeanGoal, LeanTactic, LeanProofState
 from leantree.core.lean_file import LeanTheorem, LeanFile, StoredError
@@ -95,11 +151,23 @@ _eq_sorry_pattern = re.compile(r':=\s*sorry\b')
 
 
 class LeanProcess:
-    def __init__(self, repl_exe: Path, project_path: Path, logger: utils.Logger = None, pool: Any = None):
+    def __init__(
+        self,
+        repl_exe: Path,
+        project_path: Path,
+        logger: utils.Logger = None,
+        pool: Any = None,
+        max_memory_bytes: int | None = None,
+    ):
         self.repl_exe = repl_exe
         self.project_path = project_path
         self.logger = logger if logger else utils.NullLogger()
         self.pool = pool
+        # Hard per-subprocess address-space ceiling enforced via RLIMIT_AS in
+        # ``start_async``'s preexec_fn.  ``None`` disables the limit (the
+        # Lean subprocess inherits the parent's, which is usually unlimited
+        # — and that's how a runaway tactic took down a 247 GB host).
+        self.max_memory_bytes = max_memory_bytes
 
         self._proc = None
         self._env_id = None
@@ -135,6 +203,11 @@ class LeanProcess:
         cmd = ["lake", "env", str(self.repl_exe)]
 
         self.logger.debug(f"Starting Lean REPL with command: {cmd} (working directory: {self.project_path})")
+        # preexec_fn applies RLIMIT_AS + PR_SET_PDEATHSIG to the child between
+        # fork() and execve(), so the Lean subprocess (and everything it
+        # exec's into via lake) inherits a hard memory ceiling and dies with
+        # the parent.  See _make_subprocess_preexec_fn.
+        preexec_fn = _make_subprocess_preexec_fn(self.max_memory_bytes)
         self._proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(self.project_path),
@@ -143,6 +216,7 @@ class LeanProcess:
             stderr=asyncio.subprocess.PIPE,
             # The limit argument sets the buffer limit for StreamReader wrappers for Process.stdout and Process.stderr.
             limit=16 * 1024 * 1024,  # 16 MB
+            preexec_fn=preexec_fn,
         )
         self._stderr_task = asyncio.create_task(self._monitor_stderr())
 
@@ -159,7 +233,22 @@ class LeanProcess:
         # and https://github.com/python/cpython/issues/88050
         # on why this line is necessary (otherwise the wait() call hangs).
         self._proc._transport.close()
-        await self._proc.wait()
+        # D1: bounded wait.  Without a timeout this `await wait()` can park
+        # the asyncio event loop indefinitely if the kernel can't reap the
+        # subprocess promptly (NFS hangs and disk thrash under heavy load
+        # both observed in production).  A stuck reap here cascades into
+        # every other handler thread because they all cross into the same
+        # loop via `_run_async`.  After SIGKILL the kernel should reap
+        # within milliseconds; 5 s is a generous ceiling.  If we hit it we
+        # log and move on — leaking one already-dead subprocess in zombie
+        # state is much cheaper than freezing the server.
+        try:
+            await asyncio.wait_for(self._proc.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            self.logger.warning(
+                f"Lean subprocess pid={self._proc.pid} did not reap within 5s after SIGKILL — "
+                "leaving as a zombie to keep the event loop responsive"
+            )
 
         if self._stderr_task:
             try:
