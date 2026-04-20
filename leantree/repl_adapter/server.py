@@ -382,6 +382,8 @@ class LeanServer:
                 try:
                     if self.path == "/status":
                         self._handle_status()
+                    elif self.path == "/heap":
+                        self._handle_heap()
                     else:
                         self._send_error(404, "Not Found")
                 except BrokenPipeError:
@@ -431,6 +433,56 @@ class LeanServer:
                         self._send_error(404, "Not Found")
                 else:
                     self._send_error(404, "Not Found")
+
+            def _handle_heap(self):
+                """Live Python-object census for diagnosing memory leaks.
+
+                Returns the top 30 object types by (a) count and (b) total
+                size (sys.getsizeof), plus a few named leanserver-specific
+                counts (LeanProofBranch, LeanGoal, LeanProcess) and the
+                process's current RSS.
+
+                This uses `gc.get_objects()` — no external profiling tools
+                required, no tracemalloc overhead.  sys.getsizeof only
+                accounts for the object's own header + immediate payload
+                (not referenced objects), so a 10 MB string shows as 10 MB
+                but a dict of 100 big strings only shows as the dict
+                overhead.  Good enough to identify the leak fingerprint
+                when RSS is climbing.
+
+                Walking the object graph briefly pauses Python execution
+                (GIL held) — typically <1 s for millions of objects.
+                """
+                import gc
+                import sys
+                from collections import Counter
+
+                # gc.collect() first so we don't count soon-to-be-dead objects.
+                gc.collect()
+                objs = gc.get_objects()
+                type_counts: Counter[str] = Counter()
+                type_sizes: Counter[str] = Counter()
+                for o in objs:
+                    tn = type(o).__name__
+                    type_counts[tn] += 1
+                    try:
+                        type_sizes[tn] += sys.getsizeof(o)
+                    except (TypeError, AttributeError):
+                        pass
+                try:
+                    rss_bytes = psutil.Process().memory_info().rss
+                except Exception:
+                    rss_bytes = None
+                self._send_json(200, {
+                    "total_objects": len(objs),
+                    "rss_bytes": rss_bytes,
+                    "top_by_count": type_counts.most_common(30),
+                    "top_by_size_bytes": type_sizes.most_common(30),
+                    "server_branches": len(server._branches),
+                    "server_tracked_processes": len(server._process_id_to_process),
+                    "pool_available_processes": len(server.pool.available_processes),
+                    "pool_used_processes": server.pool._num_used_processes,
+                })
 
             def _handle_status(self):
                 pool = server.pool
