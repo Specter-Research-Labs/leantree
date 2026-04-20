@@ -127,11 +127,19 @@ class LeanServer:
         # Also clean up any branches associated with this process
         self._remove_branches_for_process(process_id)
 
-    def _destroy_process(self, process_id: int):
+    def _destroy_process(self, process_id: int, reason: str | None = None):
         """Kill a process and remove it from tracking.
 
         Used when a REPL timeout or crash leaves the process in an
         undefined state and it cannot be safely returned to the pool.
+
+        Args:
+            process_id: the ID of the poisoned process.
+            reason: human-readable explanation (usually ``str(exception)``).
+                Surfaced in the warning log so we can tell at a glance
+                whether processes are dying from RLIMIT_AS, timeouts,
+                Lean segfaults, etc. — without this, every destruction
+                looked identical in the log.
 
         Note (A2): the slow `_run_async` calls below MUST happen *outside*
         ``self._lock``.  Holding the server-wide lock while waiting on the
@@ -173,7 +181,10 @@ class LeanServer:
                 f"_release_slot for poisoned process {process_id} did not complete in "
                 f"{RELEASE_SLOT_TIMEOUT}s — pool slot accounting may drift"
             )
-        self.logger.warning(f"Destroyed poisoned process {process_id}")
+        if reason:
+            self.logger.warning(f"Destroyed poisoned process {process_id}: {reason}")
+        else:
+            self.logger.warning(f"Destroyed poisoned process {process_id}")
 
     def _register_branch(self, process_id: int, branch: LeanProofBranch) -> int:
         """Register a branch and return its ID."""
@@ -541,10 +552,13 @@ class LeanServer:
                         f"send_command_async on process {process_id} did not complete in "
                         f"{DEFAULT_COMMAND_TIMEOUT + RUN_ASYNC_HEADROOM}s — destroying process"
                     )
-                    server._destroy_process(process_id)
+                    server._destroy_process(
+                        process_id,
+                        reason=f"send_command_async exceeded {DEFAULT_COMMAND_TIMEOUT + RUN_ASYNC_HEADROOM}s deadline",
+                    )
                     self._send_error(503, "leanserver event loop did not respond in time")
                 except LeanProcessException as e:
-                    server._destroy_process(process_id)
+                    server._destroy_process(process_id, reason=f"send_command_async: {e}")
                     self._send_error(500, str(e), exception=e)
                 except Exception as e:
                     self._send_error(500, str(e), exception=e)
@@ -565,10 +579,13 @@ class LeanServer:
                         f"is_valid_source_async on process {process_id} did not complete in "
                         f"{DEFAULT_IS_VALID_SOURCE_TIMEOUT + RUN_ASYNC_HEADROOM}s — destroying process"
                     )
-                    server._destroy_process(process_id)
+                    server._destroy_process(
+                        process_id,
+                        reason=f"is_valid_source_async exceeded {DEFAULT_IS_VALID_SOURCE_TIMEOUT + RUN_ASYNC_HEADROOM}s deadline",
+                    )
                     self._send_error(503, "leanserver event loop did not respond in time")
                 except LeanProcessException as e:
-                    server._destroy_process(process_id)
+                    server._destroy_process(process_id, reason=f"is_valid_source_async: {e}")
                     self._send_error(500, str(e), exception=e)
                 except Exception as e:
                     self._send_error(500, str(e), exception=e)
@@ -630,7 +647,10 @@ class LeanServer:
                             f"proof_from_sorry on process {process_id} did not complete in "
                             f"{DEFAULT_PROOF_FROM_SORRY_TIMEOUT + RUN_ASYNC_HEADROOM}s — destroying process"
                         )
-                        server._destroy_process(process_id)
+                        server._destroy_process(
+                            process_id,
+                            reason=f"proof_from_sorry exceeded {DEFAULT_PROOF_FROM_SORRY_TIMEOUT + RUN_ASYNC_HEADROOM}s deadline",
+                        )
                         self._send_error(503, "leanserver event loop did not respond in time")
                         return
                     except LeanInteractionException as e:
@@ -656,7 +676,7 @@ class LeanServer:
                     }
                     self._send_json(200, {"value": response})
                 except LeanProcessException as e:
-                    server._destroy_process(process_id)
+                    server._destroy_process(process_id, reason=f"proof_from_sorry: {e}")
                     self._send_error(500, str(e), exception=e)
                 except Exception as e:
                     self._send_error(500, str(e), exception=e)
@@ -697,10 +717,13 @@ class LeanServer:
                         f"try_apply_tactic on process {process_id}/branch {branch_id} did not complete in "
                         f"{run_async_timeout}s — destroying process"
                     )
-                    server._destroy_process(process_id)
+                    server._destroy_process(
+                        process_id,
+                        reason=f"try_apply_tactic exceeded {run_async_timeout}s deadline (branch {branch_id})",
+                    )
                     self._send_error(503, "leanserver event loop did not respond in time")
                 except LeanProcessException as e:
-                    server._destroy_process(process_id)
+                    server._destroy_process(process_id, reason=f"try_apply_tactic: {e}")
                     self._send_error(500, str(e), exception=e)
                 except Exception as e:
                     self._send_error(500, str(e), exception=e)

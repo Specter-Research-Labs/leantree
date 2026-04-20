@@ -181,6 +181,47 @@ class LeanProcess:
         # Python versions tie the lock to the running event loop.
         self._io_lock = None
 
+    def _describe_ended_process(self) -> str:
+        """Human-readable explanation of why the REPL subprocess ended.
+
+        Used when we observe EOF on stdout — the precise cause is the single
+        most useful piece of information for debugging a run (e.g. "is our
+        RLIMIT_AS too strict?" is only answerable if the server log shows
+        SIGKILL specifically).  Combines:
+        - the subprocess exit code / signal (sign-negated is the signal),
+        - the last few lines the subprocess wrote to stderr (already
+          captured by `_monitor_stderr`),
+        - a best-guess tag for common causes (SIGKILL → probably RLIMIT_AS
+          or the OOM killer).
+        """
+        rc = getattr(self._proc, "returncode", None)
+        if rc is None:
+            exit_desc = "still running (race: stdout closed before wait() saw the exit)"
+        elif rc >= 0:
+            exit_desc = f"exited with code {rc}"
+        else:
+            sig = -rc
+            try:
+                sig_name = signal.Signals(sig).name
+            except (ValueError, AttributeError):
+                sig_name = f"signal {sig}"
+            hint = ""
+            if sig == signal.SIGKILL:
+                # SIGKILL has three common causes in this system:
+                # 1. Our own kill-on-deadline watchdog (caller re-tags).
+                # 2. The kernel enforcing RLIMIT_AS (our 8 GiB ceiling).
+                # 3. The kernel OOM killer (host is out of memory).
+                hint = (
+                    " — likely RLIMIT_AS ceiling hit or kernel OOM killer; "
+                    "if this recurs, consider raising --max-process-memory-gb"
+                )
+            elif sig == signal.SIGSEGV:
+                hint = " — Lean segfault (likely tactic bug in the REPL)"
+            exit_desc = f"killed by {sig_name}{hint}"
+        stderr_tail = list(self._stderr_buffer)[-10:]
+        stderr_part = f" — last stderr: {stderr_tail!r}" if stderr_tail else ""
+        return f"Lean REPL process ended unexpectedly ({exit_desc}){stderr_part}"
+
     async def _monitor_stderr(self):
         """Read stderr in the background and buffer the last few lines."""
         try:
@@ -358,7 +399,17 @@ class LeanProcess:
             while True:
                 line = await self._proc.stdout.readline()
                 if not line:
-                    raise LeanProcessException("Lean REPL process ended unexpectedly")
+                    # The subprocess's stdout closed — it has exited (or is
+                    # about to).  Build a richer diagnostic so we can tell
+                    # *why* from the server log alone.  Cases we care about:
+                    #   - returncode == -9 (SIGKILL): RLIMIT_AS ceiling hit,
+                    #     kernel OOM killer, or our own kill-on-deadline.
+                    #   - returncode == -11 (SIGSEGV): Lean segfault.
+                    #   - returncode > 0: Lean exited on its own.
+                    # If we're the ones who just killed the process via the
+                    # deadline watchdog, the outer code tags the error with
+                    # the timeout reason, so don't over-log here.
+                    raise LeanProcessException(self._describe_ended_process())
                 decoded_line = line.decode('utf-8')
                 if decoded_line.strip() == "":
                     break

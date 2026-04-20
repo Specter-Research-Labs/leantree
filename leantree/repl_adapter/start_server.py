@@ -44,7 +44,7 @@ def _raise_nofile_soft_limit(target: int = DEFAULT_NOFILE_SOFT_LIMIT) -> None:
     except (ValueError, OSError) as e:
         print(f"Could not raise RLIMIT_NOFILE from {soft} to {new_soft}: {e}", file=sys.stderr)
         return
-    print(f"Raised RLIMIT_NOFILE soft limit from {soft} to {new_soft} (hard={hard})")
+    print(f"Raised RLIMIT_NOFILE soft limit from {soft} to {new_soft} (hard={hard})", flush=True)
 
 # Terminal settings preservation
 # ----------------------------
@@ -74,6 +74,16 @@ atexit.register(_restore_terminal)
 
 def main():
     """CLI entry point for the Lean server."""
+    # Line-buffer stdout so nohup-redirected log files show diagnostic prints
+    # immediately (RLIMIT_NOFILE raise, RLIMIT_AS default, warmup progress,
+    # SIGUSR1 registration) rather than waiting for block-buffer flush.
+    # Without this, empty log files mid-run masked useful startup info.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
+
     parser = argparse.ArgumentParser(description="Start a Lean server")
     parser.add_argument(
         "--address",
