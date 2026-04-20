@@ -2,6 +2,8 @@
 
 import argparse
 import atexit
+import ctypes
+import ctypes.util
 import faulthandler
 import logging
 import os
@@ -15,6 +17,39 @@ from pathlib import Path
 from leantree.repl_adapter.server import start_server, LeanClient
 from leantree.repl_adapter.process_pool import LeanProcessPool
 from leantree.utils import Logger, LogLevel
+
+
+# prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY) — allows any same-uid process to
+# attach via ptrace (py-spy, gdb, strace).  Required on hosts that have
+# /proc/sys/kernel/yama/ptrace_scope = 1 (default on Ubuntu), where by
+# default only a direct parent can ptrace.  With this call at startup,
+# `py-spy dump --pid <leanserver>` and `py-spy record` work without sudo.
+# Security note: this is only a concern on shared hosts where another user
+# could gain our uid; on dedicated compute nodes where the leanserver runs
+# under our own account and no untrusted code runs as the same user, this
+# is safe.  See prctl(2).
+_PR_SET_PTRACER = 0x59616D61  # PR_SET_PTRACER
+_PR_SET_PTRACER_ANY = 0xFFFFFFFFFFFFFFFF  # (pid_t)-1 as unsigned
+
+
+def _allow_ptrace_from_same_uid() -> None:
+    """Permit py-spy / gdb attach from any same-uid process.
+
+    No-op on non-Linux (prctl unavailable) or if libc can't be found.
+    """
+    libc_path = ctypes.util.find_library("c") or "libc.so.6"
+    try:
+        libc = ctypes.CDLL(libc_path, use_errno=True)
+    except OSError as e:
+        print(f"Could not open libc to call prctl(PR_SET_PTRACER): {e}", file=sys.stderr, flush=True)
+        return
+    rc = libc.prctl(_PR_SET_PTRACER, ctypes.c_ulong(_PR_SET_PTRACER_ANY), 0, 0, 0)
+    if rc == 0:
+        print("prctl(PR_SET_PTRACER, ANY) OK: py-spy / gdb can now attach without sudo", flush=True)
+    else:
+        errno = ctypes.get_errno()
+        print(f"prctl(PR_SET_PTRACER, ANY) returned {rc} (errno={errno}); py-spy attach may need sudo",
+              file=sys.stderr, flush=True)
 
 
 # Default soft limit for open file descriptors.  The OS default of 1024 is too
@@ -162,6 +197,15 @@ def main():
     # FD limit must be raised BEFORE the HTTP socket is opened or any subprocess
     # is spawned, so do it as early as possible after argparse.
     _raise_nofile_soft_limit()
+
+    # Opt-in to being ptrace-able by any same-uid process.  On hosts with
+    # /proc/sys/kernel/yama/ptrace_scope = 1 (default on Ubuntu), only a
+    # direct parent can attach via ptrace; py-spy / gdb / strace then
+    # fail with "Permission Denied" unless run as root.  Calling
+    # prctl(PR_SET_PTRACER, ANY) here lifts that restriction for this
+    # specific process, so we can attach diagnostic tools on demand
+    # without SSH'ing in as root.  See prctl(2).
+    _allow_ptrace_from_same_uid()
 
     # Make `kill -USR1 <pid>` dump a Python traceback for every thread to
     # stderr.  Pure diagnostic surface — does not affect normal operation.  The
