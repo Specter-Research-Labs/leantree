@@ -142,12 +142,18 @@ def main():
     parser.add_argument(
         "--max-process-memory-gb",
         type=float,
-        default=8.0,
+        default=32.0,
         help=(
-            "Per-Lean-subprocess RLIMIT_AS in GiB (default: 8). When a tactic's "
+            "Per-Lean-subprocess RLIMIT_AS in GiB (default: 32). When a tactic's "
             "address space exceeds this, the kernel SIGKILLs the subprocess "
             "cleanly; the pool's existing poisoned-process logic swaps in a "
-            "fresh one. 0 disables the limit (not recommended in production)."
+            "fresh one. 0 disables the limit (not recommended in production). "
+            "8 GiB was experimentally too tight for Mathlib — Lean's "
+            "multi-threaded runtime allocates pthread stacks via mmap and the "
+            "address space fills quickly even before tactics execute, so the "
+            "leanserver fails to create its worker threads. 32 GiB is "
+            "comfortably above steady-state use (~2-4 GiB) and well below "
+            "the pathological cases we've seen (~100 GiB)."
         )
     )
 
