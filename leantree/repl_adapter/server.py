@@ -434,13 +434,24 @@ class LeanServer:
 
             def _handle_status(self):
                 pool = server.pool
-                
+
                 # Get per-CPU core utilization
                 cpu_percent_per_core = psutil.cpu_percent(percpu=True)
-                
+
                 # Get RAM utilization
                 memory = psutil.virtual_memory()
-                
+
+                # Leanserver Python-process RSS.  A sudden growth here is
+                # a memory leak in our own code (observed: h5 grew to 110
+                # GiB while h4 stayed at 50 MB under identical workload —
+                # root cause still under investigation).  Exposing this
+                # per-poll makes the growth observable externally without
+                # having to SSH in and run `ps`.
+                try:
+                    self_rss_bytes = psutil.Process().memory_info().rss
+                except Exception:
+                    self_rss_bytes = None
+
                 available = len(pool.available_processes)
                 used = pool._num_used_processes
                 starting = pool._num_starting_processes
@@ -482,6 +493,10 @@ class LeanServer:
                         "used_bytes": memory.used,
                         "percent": memory.percent,
                     },
+                    # Python-process-level RSS for the leanserver itself.
+                    # Grow-over-time here signals a leak in our own code;
+                    # see the note in _handle_status.  None if unavailable.
+                    "leanserver_rss_bytes": self_rss_bytes,
                     "inactive_processes": inactive_processes,
                     "total_tracked_processes": total_tracked_processes,
                     "inactive_branches": inactive_branches,
