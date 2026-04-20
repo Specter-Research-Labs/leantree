@@ -250,7 +250,16 @@ def main():
     if args.imports:
         async def setup_imports(process):
             imports_str = "\n".join(f"import {imp}" for imp in args.imports)
-            await process.send_command_async(imports_str)
+            # Warmup-specific timeout: Mathlib (+ FormalConjectures +
+            # FormalConjecturesForMathlib) can take >5 min to import on a
+            # loaded host.  We've seen the leanserver crash during warmup
+            # three times in production when the default 300s timeout
+            # fired before all 62 parallel imports completed.  Give the
+            # warmup a generous 30 min ceiling — it's still a safety net
+            # (a hung import stops dead-locking the whole server) but
+            # won't falsely trigger on cold disk caches or system load
+            # spikes.
+            await process.send_command_async(imports_str, timeout=1800.0)
         env_setup_async = setup_imports
 
     max_process_memory_bytes = (

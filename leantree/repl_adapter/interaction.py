@@ -497,8 +497,23 @@ class LeanProcess:
         except json.JSONDecodeError:
             self.logger.debug(f"Received from REPL (could not parse): '{response_str}'")
 
-    async def send_command_async(self, command: str, proof_trees: bool = False, info_trees: bool = False) -> dict:
-        """Send a command to the REPL asynchronously and return the response."""
+    async def send_command_async(
+        self,
+        command: str,
+        proof_trees: bool = False,
+        info_trees: bool = False,
+        timeout: float | None = 300.0,
+    ) -> dict:
+        """Send a command to the REPL asynchronously and return the response.
+
+        Args:
+            command: the Lean code to send to the REPL.
+            timeout: seconds to wait for the REPL response.  Default 300s
+                matches ``_send_to_repl_async``'s default.  Callers that send
+                expensive long-running commands (e.g. ``import Mathlib`` at
+                warmup under heavy system load — observed to take >5 min on
+                loaded hosts) should pass a larger value.
+        """
         self._assert_started()
 
         # Note: This is a temporary hack to avoid sending sorry without "by".
@@ -512,7 +527,7 @@ class LeanProcess:
         if info_trees:
             data["infotree"] = "no_children"
 
-        response = await self._send_to_repl_async(data)
+        response = await self._send_to_repl_async(data, timeout=timeout)
 
         if "env" not in response:
             # REPL returned a fatal error without advancing the environment.
