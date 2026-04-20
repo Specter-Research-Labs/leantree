@@ -171,8 +171,16 @@ def main():
     parser.add_argument(
         "--warmup-batch-size",
         type=int,
-        default=None,
-        help="Start warmup processes in batches of this size to limit resource contention (default: all at once)"
+        default=16,
+        help=(
+            "Start warmup processes in batches of this size to limit resource "
+            "contention (default: 16). Starting all 62 parallel `lake env repl` "
+            "processes simultaneously thunders the CPU (62 Mathlib inits on 64 "
+            "cores), which causes individual imports to miss the 300s response "
+            "deadline and blows up warmup. 16 at a time keeps load ~reasonable "
+            "and finishes in ~4 minutes. Use 0 to disable batching (old "
+            "all-at-once behavior), or a larger number if the host is idle."
+        ),
     )
     parser.add_argument(
         "--max-process-memory-gb",
@@ -250,16 +258,13 @@ def main():
     if args.imports:
         async def setup_imports(process):
             imports_str = "\n".join(f"import {imp}" for imp in args.imports)
-            # Warmup-specific timeout: Mathlib (+ FormalConjectures +
-            # FormalConjecturesForMathlib) can take >5 min to import on a
-            # loaded host.  We've seen the leanserver crash during warmup
-            # three times in production when the default 300s timeout
-            # fired before all 62 parallel imports completed.  Give the
-            # warmup a generous 30 min ceiling — it's still a safety net
-            # (a hung import stops dead-locking the whole server) but
-            # won't falsely trigger on cold disk caches or system load
-            # spikes.
-            await process.send_command_async(imports_str, timeout=1800.0)
+            # Default 300s timeout is fine here: with --warmup-batch-size
+            # keeping CPU contention bounded, Mathlib + FormalConjectures
+            # imports finish in <1 min per batch.  Keeping the default
+            # means the timeout still serves as a real deadlock safety
+            # net — a hung import fails fast instead of stalling warmup
+            # for 30 min.
+            await process.send_command_async(imports_str)
         env_setup_async = setup_imports
 
     max_process_memory_bytes = (
