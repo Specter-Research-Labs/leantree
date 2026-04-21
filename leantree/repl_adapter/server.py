@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+import contextlib
 import json
 import logging
 import threading
@@ -48,6 +49,95 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     request_queue_size = 128
 
 
+class _ProcessRegistry:
+    """Thread-safe bidirectional map: process_id <-> LeanProcess, plus last-used timestamps.
+
+    Replaces three dicts + one lock + one id counter that were previously
+    sprinkled around ``LeanServer`` and hand-juggled in at least seven call
+    sites (``_destroy_process``, ``_handle_return_process``, ``stop``,
+    ``_reap_leaked_processes``, ...).  Every atomic update has to touch all
+    three dicts consistently — forgetting to pop one was how we leaked
+    ``LeanProcess`` objects into ``pool.checkpoints`` (fixed in
+    commit 013014b).  Encapsulating the invariant here means each call site
+    reads as one operation instead of four, and new call sites can't
+    accidentally leave the dicts out of sync.
+    """
+
+    def __init__(self):
+        self._id_to_process: dict[int, LeanProcess] = {}
+        self._process_to_id: dict[LeanProcess, int] = {}
+        self._last_used: dict[int, float] = {}
+        self._id_counter: int = 0
+        self._lock = threading.Lock()
+
+    def register(self, process: LeanProcess) -> int:
+        """Get-or-create a stable integer id for ``process``. Touches last-used."""
+        with self._lock:
+            now = time.time()
+            if process in self._process_to_id:
+                pid = self._process_to_id[process]
+                self._last_used[pid] = now
+                return pid
+            self._id_counter += 1
+            pid = self._id_counter
+            self._process_to_id[process] = pid
+            self._id_to_process[pid] = process
+            self._last_used[pid] = now
+            return pid
+
+    def get(self, process_id: int) -> LeanProcess:
+        """Look up a process by id. Raises ``ValueError`` if not registered. Touches last-used."""
+        with self._lock:
+            if process_id not in self._id_to_process:
+                raise ValueError(f"Process {process_id} not found")
+            self._last_used[process_id] = time.time()
+            return self._id_to_process[process_id]
+
+    def remove(self, process_id: int) -> LeanProcess | None:
+        """Atomically unregister ``process_id`` and return its LeanProcess (or None if unknown)."""
+        with self._lock:
+            process = self._id_to_process.pop(process_id, None)
+            if process is not None:
+                self._process_to_id.pop(process, None)
+            self._last_used.pop(process_id, None)
+            return process
+
+    def __contains__(self, process_id: int) -> bool:
+        with self._lock:
+            return process_id in self._id_to_process
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._id_to_process)
+
+    def inactive_count(self, inactive_threshold_s: float) -> tuple[int, int]:
+        """Return (inactive_count, total_count) where inactive = last_used older than threshold."""
+        now = time.time()
+        with self._lock:
+            inactive = sum(
+                1 for last in self._last_used.values() if now - last > inactive_threshold_s
+            )
+            return inactive, len(self._last_used)
+
+    def find_stale(self, stale_threshold_s: float) -> list[int]:
+        """Return process_ids whose last_used is older than ``stale_threshold_s`` (used by the reaper)."""
+        now = time.time()
+        with self._lock:
+            return [
+                pid for pid, last in list(self._last_used.items())
+                if now - last > stale_threshold_s
+            ]
+
+    def drain(self) -> list[LeanProcess]:
+        """Atomically remove and return every registered process. Used during shutdown."""
+        with self._lock:
+            processes = list(self._id_to_process.values())
+            self._id_to_process.clear()
+            self._process_to_id.clear()
+            self._last_used.clear()
+            return processes
+
+
 class LeanServer:
     """Manages a LeanProcessPool and exposes it over a HTTP port."""
 
@@ -67,20 +157,19 @@ class LeanServer:
             handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
             self.logger.addHandler(handler)
 
-        self._process_id_counter = 0
-        self._process_id_to_process = {}  # Maps process_id to LeanProcess
-        self._process_to_id = {}  # Maps LeanProcess to process_id
-        self._lock = threading.Lock()
+        # Process tracking: encapsulates id<->process bidirectional map and
+        # last-used timestamps in one lock; see _ProcessRegistry.
+        self._processes = _ProcessRegistry()
         self._event_loop = None
         self._loop_thread = None
-        
+
         # Branch tracking: maps (process_id, branch_id) to LeanProofBranch
         self._branch_id_counter = 0
         self._branches: dict[tuple[int, int], LeanProofBranch] = {}
         self._branches_lock = threading.Lock()
-        
-        # Last used tracking for inactivity detection
-        self._process_last_used: dict[int, float] = {}  # process_id -> timestamp
+
+        # Last used tracking for inactivity detection (branches only; processes
+        # live in self._processes)
         self._branch_last_used: dict[tuple[int, int], float] = {}  # (process_id, branch_id) -> timestamp
         
         # Request tracking for monitoring
@@ -95,36 +184,15 @@ class LeanServer:
 
     def _get_process_id(self, process: LeanProcess) -> int:
         """Get or create a process ID for a LeanProcess."""
-        with self._lock:
-            if process in self._process_to_id:
-                process_id = self._process_to_id[process]
-                self._process_last_used[process_id] = time.time()
-                return process_id
-            self._process_id_counter += 1
-            process_id = self._process_id_counter
-            self._process_to_id[process] = process_id
-            self._process_id_to_process[process_id] = process
-            self._process_last_used[process_id] = time.time()
-            return process_id
+        return self._processes.register(process)
 
     def _get_process(self, process_id: int) -> LeanProcess:
         """Get a LeanProcess by its ID."""
-        with self._lock:
-            if process_id not in self._process_id_to_process:
-                raise ValueError(f"Process {process_id} not found")
-            self._process_last_used[process_id] = time.time()
-            return self._process_id_to_process[process_id]
+        return self._processes.get(process_id)
 
     def _remove_process(self, process_id: int):
-        """Remove a process from tracking."""
-        with self._lock:
-            if process_id in self._process_id_to_process:
-                process = self._process_id_to_process[process_id]
-                del self._process_id_to_process[process_id]
-                if process in self._process_to_id:
-                    del self._process_to_id[process]
-            self._process_last_used.pop(process_id, None)
-        # Also clean up any branches associated with this process
+        """Remove a process from tracking and its branches."""
+        self._processes.remove(process_id)
         self._remove_branches_for_process(process_id)
 
     def _destroy_process(self, process_id: int, reason: str | None = None):
@@ -142,18 +210,15 @@ class LeanServer:
                 looked identical in the log.
 
         Note (A2): the slow `_run_async` calls below MUST happen *outside*
-        ``self._lock``.  Holding the server-wide lock while waiting on the
-        asyncio loop would freeze every other handler that needs the lock
+        the process-registry lock.  Holding a server-wide lock while waiting
+        on the asyncio loop would freeze every other handler that needs it
         (status, get_process_id, return_process, ...) if the loop ever
-        slows down — which is exactly the cascading-deadlock failure mode
-        we're fixing.
+        slowed down — exactly the cascading-deadlock failure mode we're
+        fixing.  ``_ProcessRegistry.remove`` scopes its lock to the atomic
+        dict pop and releases before we return.
         """
-        # Step 1: snapshot + drop the lock as fast as possible.
-        with self._lock:
-            process = self._process_id_to_process.pop(process_id, None)
-            if process is not None and process in self._process_to_id:
-                del self._process_to_id[process]
-            self._process_last_used.pop(process_id, None)
+        # Step 1: atomic unregister; releases the registry lock immediately.
+        process = self._processes.remove(process_id)
         self._remove_branches_for_process(process_id)
         if process is None:
             return
@@ -206,8 +271,8 @@ class LeanServer:
             (retaining its ~16 MiB-per-stream asyncio StreamReader buffers),
           - ``pool._num_used_processes`` is never decremented (slot leak),
           - the lake/repl subprocess keeps running.
-        The reaper can't help because ``_process_last_used`` was already
-        popped.  This helper is the destroy-by-object counterpart to
+        The reaper can't help because the registry entry was already
+        removed.  This helper is the destroy-by-object counterpart to
         ``_destroy_process``, usable when the id is no longer valid.
 
         Observed in production: under event-loop saturation, many
@@ -275,15 +340,31 @@ class LeanServer:
 
     def _run_async(self, coro, timeout: float | None = None):
         """Run an async coroutine in the event loop.
-        
+
         Args:
-            coro: The coroutine to run
-            timeout: Optional timeout in seconds
+            coro: The coroutine to run.
+            timeout: Raw wait-for-future timeout in seconds. Use this when the
+                coroutine does NOT have its own inner deadline (bookkeeping,
+                ``stop_async_safe``, etc.). For coroutines that DO have their
+                own deadline, prefer ``_run_async_op`` which adds the
+                ``RUN_ASYNC_HEADROOM`` for you.
         """
         if self._event_loop is None:
             raise RuntimeError("Server not started")
         future = asyncio.run_coroutine_threadsafe(coro, self._event_loop)
         return future.result(timeout=timeout)
+
+    def _run_async_op(self, coro, op_timeout: float):
+        """Run a coroutine that has its own inner deadline (``op_timeout``).
+
+        Adds ``RUN_ASYNC_HEADROOM`` so the coroutine has a chance to enforce
+        its own deadline (and emit a meaningful ``LeanProcessException``)
+        before the outer threadsafe wait gives up with a generic TimeoutError.
+        Forgetting this headroom used to be a latent-deadlock footgun — the
+        outer wait would fire first, cancel observation of the coroutine, and
+        the inner operation would never surface its real error.
+        """
+        return self._run_async(coro, timeout=op_timeout + RUN_ASYNC_HEADROOM)
     
     def _start_request(self, path: str) -> int:
         """Register start of a request. Returns request_id."""
@@ -319,20 +400,14 @@ class LeanServer:
     def _reap_leaked_processes(self):
         """Periodically reclaim processes whose clients have disappeared.
 
-        A process is considered leaked when it has been checked out (present in
-        ``_process_id_to_process``) but not touched for longer than
+        A process is considered leaked when it has been checked out (tracked in
+        ``self._processes``) but not touched for longer than
         ``_process_lease_timeout`` seconds AND there is no active HTTP request
         referencing it.
         """
         while True:
             time.sleep(60)
-            now = time.time()
-            to_reclaim = []
-            with self._lock:
-                for pid, last_used in list(self._process_last_used.items()):
-                    if now - last_used > self._process_lease_timeout:
-                        to_reclaim.append(pid)
-            for pid in to_reclaim:
+            for pid in self._processes.find_stale(self._process_lease_timeout):
                 # Check there is no active request for this process (e.g.
                 # a long-running tactic application).
                 with self._requests_lock:
@@ -346,11 +421,7 @@ class LeanServer:
                     f"Reclaiming leaked process {pid} (unused for "
                     f">{self._process_lease_timeout}s)"
                 )
-                with self._lock:
-                    process = self._process_id_to_process.pop(pid, None)
-                    if process is not None and process in self._process_to_id:
-                        del self._process_to_id[process]
-                    self._process_last_used.pop(pid, None)
+                process = self._processes.remove(pid)
                 self._remove_branches_for_process(pid)
                 if process is not None:
                     try:
@@ -410,11 +481,7 @@ class LeanServer:
         # First, stop checked-out processes that the pool doesn't track.
         # Must happen while the event loop is still running.
         if self._event_loop is not None:
-            with self._lock:
-                checked_out = list(self._process_id_to_process.values())
-                self._process_id_to_process.clear()
-                self._process_to_id.clear()
-                self._process_last_used.clear()
+            checked_out = self._processes.drain()
             for process in checked_out:
                 try:
                     self._run_async(process.stop_async_safe(), timeout=STOP_ASYNC_TIMEOUT)
@@ -500,6 +567,48 @@ class LeanServer:
                 else:
                     self._send_error(404, "Not Found")
 
+            @contextlib.contextmanager
+            def _process_op_errors(self, process_id: int, op_name: str, op_timeout: float):
+                """Uniform error handling for handlers that run a per-process coroutine.
+
+                The body runs inside the context and is expected to call
+                ``server._run_async_op(...)`` with ``op_timeout`` as its
+                inner deadline (the context manager only dispatches on the
+                outer exception type — it doesn't run the coroutine itself).
+
+                On ``concurrent.futures.TimeoutError`` or ``LeanProcessException``
+                the process is destroyed (slot released, subprocess stopped,
+                ``pool.checkpoints`` evicted) and the appropriate HTTP error is
+                sent.  On any other ``Exception`` the process is left alone
+                (the failure may be unrelated to the Lean subprocess — e.g.
+                malformed request JSON) and a generic 500 is sent.
+
+                Collapses ~160 lines of near-identical try/except blocks
+                across ``_handle_command``, ``_handle_is_valid_source``,
+                ``_handle_proof_from_sorry``, and ``_handle_try_apply_tactic``.
+                Centralising the policy means future handlers inherit the
+                "destroy on timeout" reflex for free, closing a category of
+                leak-path bugs.
+                """
+                total_timeout = op_timeout + RUN_ASYNC_HEADROOM
+                try:
+                    yield
+                except concurrent.futures.TimeoutError:
+                    server.logger.error(
+                        f"{op_name} on process {process_id} did not complete in "
+                        f"{total_timeout}s — destroying process"
+                    )
+                    server._destroy_process(
+                        process_id,
+                        reason=f"{op_name} exceeded {total_timeout}s deadline",
+                    )
+                    self._send_error(503, "leanserver event loop did not respond in time")
+                except LeanProcessException as e:
+                    server._destroy_process(process_id, reason=f"{op_name}: {e}")
+                    self._send_error(500, str(e), exception=e)
+                except Exception as e:
+                    self._send_error(500, str(e), exception=e)
+
             def _handle_heap(self):
                 """Live Python-object census for diagnosing memory leaks.
 
@@ -545,7 +654,7 @@ class LeanServer:
                     "top_by_count": type_counts.most_common(30),
                     "top_by_size_bytes": type_sizes.most_common(30),
                     "server_branches": len(server._branches),
-                    "server_tracked_processes": len(server._process_id_to_process),
+                    "server_tracked_processes": len(server._processes),
                     "pool_available_processes": len(server.pool.available_processes),
                     "pool_used_processes": server.pool._num_used_processes,
                 })
@@ -581,16 +690,12 @@ class LeanServer:
                 ]
                 
                 # Count inactive processes and branches (not used in last 60 seconds)
-                now = time.time()
                 inactive_threshold = 60.0
-                
-                with server._lock:
-                    inactive_processes = sum(
-                        1 for pid, last_used in server._process_last_used.items()
-                        if now - last_used > inactive_threshold
-                    )
-                    total_tracked_processes = len(server._process_last_used)
-                
+                inactive_processes, total_tracked_processes = server._processes.inactive_count(
+                    inactive_threshold
+                )
+
+                now = time.time()
                 with server._branches_lock:
                     inactive_branches = sum(
                         1 for key, last_used in server._branch_last_used.items()
@@ -631,9 +736,9 @@ class LeanServer:
                 process = None
                 process_id = None
                 try:
-                    process = server._run_async(
+                    process = server._run_async_op(
                         server.pool.get_process_async(blocking=blocking, timeout=timeout),
-                        timeout=timeout + RUN_ASYNC_HEADROOM,
+                        op_timeout=timeout,
                     )
                     if process is None:
                         self._send_json(200, {"process_id": None})
@@ -676,79 +781,37 @@ class LeanServer:
                     self._send_error(500, str(e), exception=e)
 
             def _handle_command(self, process_id: int):
-                try:
+                with self._process_op_errors(process_id, "send_command_async", DEFAULT_COMMAND_TIMEOUT):
                     process = server._get_process(process_id)
-                    data = self._read_json()
-                    command = data["command"]
-
-                    response = server._run_async(
+                    command = self._read_json()["command"]
+                    response = server._run_async_op(
                         process.send_command_async(command),
-                        timeout=DEFAULT_COMMAND_TIMEOUT + RUN_ASYNC_HEADROOM,
+                        op_timeout=DEFAULT_COMMAND_TIMEOUT,
                     )
                     self._send_json(200, response)
-                except concurrent.futures.TimeoutError:
-                    server.logger.error(
-                        f"send_command_async on process {process_id} did not complete in "
-                        f"{DEFAULT_COMMAND_TIMEOUT + RUN_ASYNC_HEADROOM}s — destroying process"
-                    )
-                    server._destroy_process(
-                        process_id,
-                        reason=f"send_command_async exceeded {DEFAULT_COMMAND_TIMEOUT + RUN_ASYNC_HEADROOM}s deadline",
-                    )
-                    self._send_error(503, "leanserver event loop did not respond in time")
-                except LeanProcessException as e:
-                    server._destroy_process(process_id, reason=f"send_command_async: {e}")
-                    self._send_error(500, str(e), exception=e)
-                except Exception as e:
-                    self._send_error(500, str(e), exception=e)
 
             def _handle_is_valid_source(self, process_id: int):
-                try:
+                with self._process_op_errors(process_id, "is_valid_source_async", DEFAULT_IS_VALID_SOURCE_TIMEOUT):
                     process = server._get_process(process_id)
-                    data = self._read_json()
-                    source = data["source"]
-
-                    is_valid = server._run_async(
+                    source = self._read_json()["source"]
+                    is_valid = server._run_async_op(
                         process.is_valid_source_async(source),
-                        timeout=DEFAULT_IS_VALID_SOURCE_TIMEOUT + RUN_ASYNC_HEADROOM,
+                        op_timeout=DEFAULT_IS_VALID_SOURCE_TIMEOUT,
                     )
                     self._send_json(200, {"is_valid": is_valid})
-                except concurrent.futures.TimeoutError:
-                    server.logger.error(
-                        f"is_valid_source_async on process {process_id} did not complete in "
-                        f"{DEFAULT_IS_VALID_SOURCE_TIMEOUT + RUN_ASYNC_HEADROOM}s — destroying process"
-                    )
-                    server._destroy_process(
-                        process_id,
-                        reason=f"is_valid_source_async exceeded {DEFAULT_IS_VALID_SOURCE_TIMEOUT + RUN_ASYNC_HEADROOM}s deadline",
-                    )
-                    self._send_error(503, "leanserver event loop did not respond in time")
-                except LeanProcessException as e:
-                    server._destroy_process(process_id, reason=f"is_valid_source_async: {e}")
-                    self._send_error(500, str(e), exception=e)
-                except Exception as e:
-                    self._send_error(500, str(e), exception=e)
 
             def _handle_return_process(self, process_id: int):
-                # A2: snapshot under the lock, then drop it before crossing into the
-                # event loop.  The original code held server._lock through _run_async,
-                # which froze every other handler whenever the loop slowed down.
-                process = None
+                # A2: snapshot + drop tracking BEFORE crossing into the event loop.
+                # Holding server-wide state through `_run_async` froze every other
+                # handler whenever the loop slowed down.
+                # Removing from tracking before returning to pool also closes a race
+                # where another client could get the same process back under its old id.
+                process = server._processes.remove(process_id)
+                if process is None:
+                    # Already returned - this is idempotent
+                    self._send_json(200, {"status": "ok", "already_returned": True})
+                    return
                 try:
-                    with server._lock:
-                        if process_id not in server._process_id_to_process:
-                            # Already returned - this is idempotent
-                            self._send_json(200, {"status": "ok", "already_returned": True})
-                            return
-                        process = server._process_id_to_process[process_id]
-                        # Remove from tracking BEFORE returning to pool to prevent
-                        # a race where another client gets this process from the pool
-                        # while it's still tracked with the old ID
-                        del server._process_id_to_process[process_id]
-                        if process in server._process_to_id:
-                            del server._process_to_id[process]
-                        server._process_last_used.pop(process_id, None)
-                    # Clean up any branches associated with this process
                     server._remove_branches_for_process(process_id)
                     # Now return to pool - any new client will get a fresh ID
                     server._run_async(
@@ -774,32 +837,23 @@ class LeanServer:
                     self._send_error(500, str(e), exception=e)
 
             def _handle_proof_from_sorry(self, process_id: int):
-                try:
+                with self._process_op_errors(process_id, "proof_from_sorry", DEFAULT_PROOF_FROM_SORRY_TIMEOUT):
                     process = server._get_process(process_id)
-                    data = self._read_json()
-                    theorem_with_sorry = data["theorem_with_sorry"]
+                    theorem_with_sorry = self._read_json()["theorem_with_sorry"]
 
-                    # Get the first proof branch
-                    # proofs_from_sorries_async returns an AsyncIterator, so we need to collect it
+                    # proofs_from_sorries_async is an AsyncIterator; collect into a list
                     async def collect_proof_branches():
                         return [branch async for branch in process.proofs_from_sorries_async(theorem_with_sorry)]
 
+                    # LeanInteractionException is a business-level error (bad theorem
+                    # input, not a process failure) — return 200 with an error payload
+                    # rather than destroying the process.  Intercept before it escapes
+                    # to the context manager.
                     try:
-                        proof_branches = server._run_async(
+                        proof_branches = server._run_async_op(
                             collect_proof_branches(),
-                            timeout=DEFAULT_PROOF_FROM_SORRY_TIMEOUT + RUN_ASYNC_HEADROOM,
+                            op_timeout=DEFAULT_PROOF_FROM_SORRY_TIMEOUT,
                         )
-                    except concurrent.futures.TimeoutError:
-                        server.logger.error(
-                            f"proof_from_sorry on process {process_id} did not complete in "
-                            f"{DEFAULT_PROOF_FROM_SORRY_TIMEOUT + RUN_ASYNC_HEADROOM}s — destroying process"
-                        )
-                        server._destroy_process(
-                            process_id,
-                            reason=f"proof_from_sorry exceeded {DEFAULT_PROOF_FROM_SORRY_TIMEOUT + RUN_ASYNC_HEADROOM}s deadline",
-                        )
-                        self._send_error(503, "leanserver event loop did not respond in time")
-                        return
                     except LeanInteractionException as e:
                         self._send_json(200, {"error": str(e)})
                         return
@@ -807,48 +861,31 @@ class LeanServer:
                     if len(proof_branches) == 0:
                         self._send_json(200, {"error": "No sorries found in theorem"})
                         return
-
                     if len(proof_branches) > 1:
                         self._send_json(200, {"error": f"Expected 1 sorry, found {len(proof_branches)}"})
                         return
 
                     proof_branch = proof_branches[0]
-                    # Register the branch so we can use it later
                     branch_id = server._register_branch(process_id, proof_branch)
                     goals = [goal.serialize() for goal in proof_branch.state.goals]
-
-                    response = {
-                        "branch_id": branch_id,
-                        "goals": goals,
-                    }
-                    self._send_json(200, {"value": response})
-                except LeanProcessException as e:
-                    server._destroy_process(process_id, reason=f"proof_from_sorry: {e}")
-                    self._send_error(500, str(e), exception=e)
-                except Exception as e:
-                    self._send_error(500, str(e), exception=e)
+                    self._send_json(200, {"value": {"branch_id": branch_id, "goals": goals}})
 
             def _handle_try_apply_tactic(self, process_id: int, branch_id: int):
-                try:
+                data = self._read_json()
+                tactic = data["tactic"]
+                tactic_timeout_ms = data.get("timeout", DEFAULT_TRY_APPLY_TACTIC_MS)
+                # tactic timeout is ms in the payload; _run_async_op takes seconds.
+                op_timeout_s = tactic_timeout_ms / 1000.0
+                op_name = f"try_apply_tactic (branch {branch_id})"
+                with self._process_op_errors(process_id, op_name, op_timeout_s):
                     branch = server._get_branch(process_id, branch_id)
-                    data = self._read_json()
-                    tactic = data["tactic"]
-                    timeout = data.get("timeout", DEFAULT_TRY_APPLY_TACTIC_MS)
-
-                    # tactic timeout is in milliseconds; convert + add headroom for the
-                    # _run_async deadline so the inner asyncio op gets to enforce its own
-                    # SIGKILL-on-deadline first.
-                    run_async_timeout = (timeout / 1000.0) + RUN_ASYNC_HEADROOM
-                    result = server._run_async(
-                        branch.try_apply_tactic_async(tactic, timeout=timeout),
-                        timeout=run_async_timeout,
+                    result = server._run_async_op(
+                        branch.try_apply_tactic_async(tactic, timeout=tactic_timeout_ms),
+                        op_timeout=op_timeout_s,
                     )
-
                     if not result.is_success():
                         self._send_json(200, {"error": str(result.error)})
                         return
-
-                    # Register new branches and return their info
                     new_branches = result.value
                     branches_data = []
                     for new_branch in new_branches:
@@ -857,23 +894,7 @@ class LeanServer:
                             "branch_id": new_branch_id,
                             "goals": [goal.serialize() for goal in new_branch.state.goals],
                         })
-
                     self._send_json(200, {"value": branches_data})
-                except concurrent.futures.TimeoutError:
-                    server.logger.error(
-                        f"try_apply_tactic on process {process_id}/branch {branch_id} did not complete in "
-                        f"{run_async_timeout}s — destroying process"
-                    )
-                    server._destroy_process(
-                        process_id,
-                        reason=f"try_apply_tactic exceeded {run_async_timeout}s deadline (branch {branch_id})",
-                    )
-                    self._send_error(503, "leanserver event loop did not respond in time")
-                except LeanProcessException as e:
-                    server._destroy_process(process_id, reason=f"try_apply_tactic: {e}")
-                    self._send_error(500, str(e), exception=e)
-                except Exception as e:
-                    self._send_error(500, str(e), exception=e)
 
             def _handle_branch_state(self, process_id: int, branch_id: int):
                 try:
