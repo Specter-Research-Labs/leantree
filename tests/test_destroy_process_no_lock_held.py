@@ -36,6 +36,9 @@ class _FakePool:
         self._num_starting_processes = 0
         self._lock = None
         self._process_available_event = None
+        # _destroy_process's _release_slot pops this dict; without it the
+        # coroutine raises AttributeError (silently, in a background thread).
+        self.checkpoints: dict = {}
 
     @property
     def lock(self):

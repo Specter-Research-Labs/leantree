@@ -169,8 +169,17 @@ class LeanServer:
         except Exception as e:
             self.logger.warning(f"Error stopping poisoned process {process_id}: {e}")
         # Decrement pool's used count so a replacement can be created.
+        # Critically, also evict the LeanProcess from self.pool.checkpoints —
+        # otherwise every poisoned process leaks the full LeanProcess object
+        # (including its ~16 MiB-per-stream asyncio buffers for stdin /
+        # stdout / stderr) forever.  Observed in production: ~30 poisoned
+        # processes/min × hours → 200+ GiB leanserver RSS growth with
+        # ~350 live branches (i.e. the leak is in retained *dead* processes,
+        # not live branches).  return_process_async pops checkpoints on the
+        # terminate path, but _destroy_process bypasses return_process_async.
         async def _release_slot():
             async with self.pool.lock:
+                self.pool.checkpoints.pop(process, None)
                 if self.pool._num_used_processes > 0:
                     self.pool._num_used_processes -= 1
                 self.pool.process_available_event.set()
