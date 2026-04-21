@@ -25,6 +25,7 @@ class LeanProcessPool:
             env_setup_async: Callable[[LeanProcess], Coroutine] | None = None,
             logger: Logger | None = None,
             max_process_memory_bytes: int | None = None,
+            recycle_memory_ratio: float = 0.5,
     ):
         """
         Initialize the process pool.
@@ -34,16 +35,24 @@ class LeanProcessPool:
             project_path: Path to the Lean project
             max_processes: Maximum number of parallel processes
             max_memory_utilization: Maximum memory utilization as a percentage,
-                used by the legacy on-return memory check.  Largely superseded
-                by ``max_process_memory_bytes`` which is enforced by the kernel
-                via RLIMIT_AS at subprocess creation, but kept as a soft check
-                for hosts that don't enforce the kernel limit.
+                used by the on-return PSS check when RLIMIT_AS is disabled.
+                When RLIMIT_AS is on, ``recycle_memory_ratio * max_process_memory_bytes``
+                is the threshold instead.
             max_process_memory_bytes: Hard per-Lean-subprocess address-space
                 ceiling enforced by ``RLIMIT_AS`` set in a ``preexec_fn``.
                 A pathological tactic that exceeds this gets SIGKILLed by the
                 kernel and surfaces as a clean ``LeanProcessException`` —
                 which the leanserver's poisoned-process path then handles by
                 replacing the dead process.  ``None`` disables the limit.
+            recycle_memory_ratio: When RLIMIT_AS is enabled, proactively
+                recycle (terminate + replace) a process whose PSS on return
+                exceeds this fraction of ``max_process_memory_bytes``.
+                The kernel SIGKILL at 100% is a last resort that disrupts
+                the actor holding the process; recycling earlier, at a
+                calm return-to-pool moment, is cheap and avoids the
+                ``GNU MP: Cannot allocate memory`` surfaces we see under
+                load when long-lived processes accumulate env state.
+                Range (0, 1].  Default 0.5.
             logger: Optional logger
         """
         self.repl_exe = repl_exe
@@ -51,6 +60,7 @@ class LeanProcessPool:
         self.max_processes = max_processes
         self.max_memory_utilization = max_memory_utilization
         self.max_process_memory_bytes = max_process_memory_bytes
+        self.recycle_memory_ratio = recycle_memory_ratio
         self.logger = logger if logger else NullLogger()
 
         # Pool state
@@ -62,11 +72,24 @@ class LeanProcessPool:
         self._lock: asyncio.Lock | None = None
         self._process_available_event: asyncio.Event | None = None
         self.env_setup_async = env_setup_async
-        # Calculate memory threshold per server based on total system memory.
-        # This is the *legacy* on-return PSS check; the new RLIMIT_AS
-        # enforcement (max_process_memory_bytes) is the primary safety net.
-        total_memory = psutil.virtual_memory().total
-        self.memory_threshold_per_process = int(total_memory * (self.max_memory_utilization / 100) / self.max_processes)
+        # On-return PSS threshold for proactive recycling.  Prefers a
+        # fraction of the kernel-enforced RLIMIT_AS when set (that's the
+        # real ceiling the process is racing toward), falls back to a
+        # share of system RAM otherwise.  Either way we keep a finite
+        # per-process cap so a single pool can't eat the whole host.
+        if max_process_memory_bytes is not None:
+            if not 0.0 < recycle_memory_ratio <= 1.0:
+                raise ValueError(
+                    f"recycle_memory_ratio must be in (0, 1], got {recycle_memory_ratio}"
+                )
+            self.memory_threshold_per_process = int(
+                max_process_memory_bytes * recycle_memory_ratio
+            )
+        else:
+            total_memory = psutil.virtual_memory().total
+            self.memory_threshold_per_process = int(
+                total_memory * (self.max_memory_utilization / 100) / self.max_processes
+            )
 
         self._was_shutdown = False
 
@@ -271,32 +294,46 @@ class LeanProcessPool:
             process: The LeanProcess instance to return
         """
 
-        # Check shutdown OUTSIDE the lock; if the host enforces RLIMIT_AS via
-        # the preexec_fn (the new default), pathological-memory subprocesses
-        # already get SIGKILLed by the kernel as soon as they balloon — no
-        # need to re-measure PSS on return, and trying to do so for an already-
-        # killed process raises spuriously.  When `max_process_memory_bytes`
-        # is None (legacy/disabled) we still fall back to the PSS check.
+        # Two termination triggers on the return path:
+        #   1. Pool is shutting down -> stop instead of returning to the pool.
+        #   2. Process PSS exceeded ``memory_threshold_per_process``.  Even
+        #      with RLIMIT_AS (preexec_fn) enforcing a kernel SIGKILL at the
+        #      absolute ceiling, that's disruptive: the SIGKILL happens
+        #      mid-tactic, surfaces as ``GNU MP: Cannot allocate memory``,
+        #      and the actor has to retry.  Catching bloat at a calm
+        #      return-to-pool moment is cheaper and avoids the runtime
+        #      slowdown we see as long-lived processes accumulate Lean env
+        #      state between rollouts (``rollback_to`` only flips the
+        #      Python-side env_id pointer; the underlying Lean process
+        #      never frees accumulated environments).
         should_terminate = False
+        terminate_reason: str | None = None
+        measured_pss: int | None = None
+
         async with self.lock:
             if self._was_shutdown:
                 should_terminate = True
+                terminate_reason = "pool shutting down"
 
-        kernel_enforced_memory_limit = self.max_process_memory_bytes is not None
-        if not should_terminate and not kernel_enforced_memory_limit:
+        if not should_terminate and self.memory_threshold_per_process:
             try:
-                memory_usage = process.memory_usage()
-                if self.memory_threshold_per_process and memory_usage > self.memory_threshold_per_process:
-                    self.logger.info(
-                        f"Process memory usage ({memory_usage / (1024 * 1024):.2f} MB RSS) exceeds threshold "
-                        f"({self.memory_threshold_per_process / (1024 * 1024):.2f} MB). Terminating and replacing."
-                    )
-                    should_terminate = True
+                measured_pss = process.memory_usage()
             except Exception as e:
-                self.logger.warning(f"Error checking process memory: {e}. Terminating process.")
+                self.logger.warning(
+                    f"Error measuring process PSS on return: {e}. Terminating process as a precaution."
+                )
                 should_terminate = True
+                terminate_reason = f"memory_usage() raised {type(e).__name__}: {e}"
+            else:
+                if measured_pss > self.memory_threshold_per_process:
+                    should_terminate = True
+                    terminate_reason = "PSS exceeds recycle threshold"
 
         if should_terminate:
+            self._log_recycle(
+                reason=terminate_reason or "unspecified",
+                measured_pss=measured_pss,
+            )
             await process.stop_async()
             async with self.lock:
                 self.checkpoints.pop(process, None)
@@ -319,6 +356,31 @@ class LeanProcessPool:
             self.process_available_event.set()
 
     return_process = to_sync(return_process_async)
+
+    def _log_recycle(self, reason: str, measured_pss: int | None):
+        """Emit a single informative log line when a process is being recycled.
+
+        Reports measured PSS, the configured recycle threshold, and the hard
+        RLIMIT_AS ceiling (if any) so a reader can see how close the process
+        was to each.  The recycle-rate trend over time is one of the most
+        useful signals for tuning ``recycle_memory_ratio`` vs.
+        ``max_process_memory_bytes``.
+        """
+        mib = 1024 * 1024
+        threshold_mib = (self.memory_threshold_per_process or 0) / mib
+        rlimit_mib = (self.max_process_memory_bytes / mib) if self.max_process_memory_bytes else None
+        pss_str = f"{measured_pss / mib:.1f} MiB" if measured_pss is not None else "n/a"
+        if rlimit_mib is not None and measured_pss is not None:
+            ratio_of_rlimit = f"{measured_pss / self.max_process_memory_bytes * 100:.1f}%"
+            limit_str = f"RLIMIT_AS {rlimit_mib:.0f} MiB ({ratio_of_rlimit} of cap)"
+        elif rlimit_mib is not None:
+            limit_str = f"RLIMIT_AS {rlimit_mib:.0f} MiB"
+        else:
+            limit_str = "no RLIMIT_AS set"
+        self.logger.info(
+            f"Recycling Lean process: {reason}. "
+            f"PSS={pss_str}, recycle threshold={threshold_mib:.1f} MiB, {limit_str}."
+        )
 
     async def shutdown_async(self):
         """Shut down all processes in the pool asynchronously."""
