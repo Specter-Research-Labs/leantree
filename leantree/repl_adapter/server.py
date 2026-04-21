@@ -195,6 +195,57 @@ class LeanServer:
         else:
             self.logger.warning(f"Destroyed poisoned process {process_id}")
 
+    def _destroy_untracked_process(self, process: LeanProcess, reason: str | None = None):
+        """Clean up a LeanProcess that has already been removed from server tracking.
+
+        Three code paths do "remove-from-tracking first, then return-to-pool":
+        ``_handle_return_process``, ``_handle_get_process``'s BrokenPipeError
+        branch, and ``_reap_leaked_processes``.  If the subsequent
+        ``return_process_async`` times out or raises, the process is orphaned:
+          - ``pool.checkpoints`` still holds the LeanProcess Python object
+            (retaining its ~16 MiB-per-stream asyncio StreamReader buffers),
+          - ``pool._num_used_processes`` is never decremented (slot leak),
+          - the lake/repl subprocess keeps running.
+        The reaper can't help because ``_process_last_used`` was already
+        popped.  This helper is the destroy-by-object counterpart to
+        ``_destroy_process``, usable when the id is no longer valid.
+
+        Observed in production: under event-loop saturation, many
+        ``return_process_async`` calls exceeded RETURN_PROCESS_TIMEOUT, each
+        one leaked a ~3-6 GiB lake/repl child + its Python-side buffers.
+        Over hours the leanserver accumulated 20+ extra subprocesses and
+        grew to hundreds of GiB of RAM.
+        """
+        try:
+            self._run_async(process.stop_async_safe(), timeout=STOP_ASYNC_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            self.logger.error(
+                f"stop_async_safe on orphaned process did not complete in "
+                f"{STOP_ASYNC_TIMEOUT}s — leaking the subprocess to avoid blocking the loop"
+            )
+        except Exception as e:
+            self.logger.warning(f"Error stopping orphaned process: {e}")
+
+        async def _release_slot():
+            async with self.pool.lock:
+                self.pool.checkpoints.pop(process, None)
+                if self.pool._num_used_processes > 0:
+                    self.pool._num_used_processes -= 1
+                self.pool.process_available_event.set()
+
+        try:
+            self._run_async(_release_slot(), timeout=RELEASE_SLOT_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            self.logger.error(
+                f"_release_slot for orphaned process did not complete in "
+                f"{RELEASE_SLOT_TIMEOUT}s — pool slot accounting may drift"
+            )
+        except Exception as e:
+            self.logger.warning(f"Error releasing slot for orphaned process: {e}")
+
+        if reason:
+            self.logger.warning(f"Destroyed orphaned process: {reason}")
+
     def _register_branch(self, process_id: int, branch: LeanProofBranch) -> int:
         """Register a branch and return its ID."""
         with self._branches_lock:
@@ -309,11 +360,17 @@ class LeanServer:
                         )
                     except concurrent.futures.TimeoutError:
                         self.logger.error(
-                            f"return_process_async for leaked process {pid} did not complete in "
-                            f"{RETURN_PROCESS_TIMEOUT}s — leaking the subprocess to avoid blocking the reaper"
+                            f"return_process_async for leaked process {pid} exceeded "
+                            f"{RETURN_PROCESS_TIMEOUT}s — destroying orphaned process"
+                        )
+                        self._destroy_untracked_process(
+                            process, reason=f"reaper return timed out for process_id={pid}"
                         )
                     except Exception as e:
-                        self.logger.error(f"Error returning leaked process {pid}: {e}")
+                        self.logger.error(f"Error returning leaked process {pid}: {e} — destroying orphaned process")
+                        self._destroy_untracked_process(
+                            process, reason=f"reaper return raised: {type(e).__name__}: {e}"
+                        )
 
     def start(self):
         """Start the HTTP server."""
@@ -604,10 +661,16 @@ class LeanServer:
                         except concurrent.futures.TimeoutError:
                             server.logger.error(
                                 f"return_process_async after client disconnect did not complete in "
-                                f"{RETURN_PROCESS_TIMEOUT}s"
+                                f"{RETURN_PROCESS_TIMEOUT}s — destroying orphaned process"
+                            )
+                            server._destroy_untracked_process(
+                                process, reason="return timed out after client disconnect"
                             )
                         except Exception as e:
-                            server.logger.error(f"Error returning process after client disconnect: {e}")
+                            server.logger.error(f"Error returning process after client disconnect: {e} — destroying orphaned process")
+                            server._destroy_untracked_process(
+                                process, reason=f"return raised after client disconnect: {type(e).__name__}: {e}"
+                            )
                     raise  # Re-raise to let the server handle the broken connection
                 except Exception as e:
                     self._send_error(500, str(e), exception=e)
@@ -695,11 +758,19 @@ class LeanServer:
                     self._send_json(200, {"status": "ok"})
                 except concurrent.futures.TimeoutError:
                     server.logger.error(
-                        f"return_process_async for process {process_id} did not complete in "
-                        f"{RETURN_PROCESS_TIMEOUT}s — process will be reaped as leaked"
+                        f"return_process_async for process {process_id} exceeded "
+                        f"{RETURN_PROCESS_TIMEOUT}s — destroying orphaned process to avoid leak"
                     )
+                    if process is not None:
+                        server._destroy_untracked_process(
+                            process, reason=f"return_process_async timed out for process_id={process_id}"
+                        )
                     self._send_error(503, "leanserver event loop did not respond in time")
                 except Exception as e:
+                    if process is not None:
+                        server._destroy_untracked_process(
+                            process, reason=f"return_process_async raised {type(e).__name__}: {e}"
+                        )
                     self._send_error(500, str(e), exception=e)
 
             def _handle_proof_from_sorry(self, process_id: int):

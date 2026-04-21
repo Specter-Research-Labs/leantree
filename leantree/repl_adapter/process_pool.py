@@ -86,12 +86,22 @@ class LeanProcessPool:
 
     async def _create_process_async(self, track_starting: bool = True) -> LeanProcess:
         """Create a new LeanProcess instance.
-        
+
+        If ``env_setup_async`` raises after ``start_async`` succeeded, the
+        half-created subprocess would be orphaned (asyncio's Process, plus its
+        ~48 MiB of StreamReader buffers, plus the live lake/repl child) —
+        nothing else references it, so Python GC eventually runs, but
+        ``_stderr_task`` is registered on the event loop and keeps the whole
+        thing alive until that task exits.  Be explicit: on any exception after
+        a successful ``start_async``, call ``stop_async_safe`` before re-raising.
+
         Args:
             track_starting: If True, increment/decrement _num_starting_processes counter.
         """
         if track_starting:
             self._num_starting_processes += 1
+        process = None
+        started = False
         try:
             process = LeanProcess(
                 self.repl_exe,
@@ -101,10 +111,20 @@ class LeanProcessPool:
                 max_memory_bytes=self.max_process_memory_bytes,
             )
             await process.start_async()
+            started = True
             if self.env_setup_async:
                 await self.env_setup_async(process)
             self.checkpoints[process] = process.checkpoint()
             return process
+        except Exception:
+            if started and process is not None:
+                try:
+                    await process.stop_async_safe()
+                except Exception as cleanup_err:
+                    self.logger.warning(
+                        f"stop_async_safe during _create_process_async cleanup failed: {cleanup_err}"
+                    )
+            raise
         finally:
             if track_starting:
                 self._num_starting_processes -= 1
