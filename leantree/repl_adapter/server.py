@@ -808,30 +808,39 @@ class LeanServer:
                     # Already returned - this is idempotent
                     self._send_json(200, {"status": "ok", "already_returned": True})
                     return
+                server._remove_branches_for_process(process_id)
+                # Keep the try narrow around return_process_async only. If we
+                # also wrapped _send_json, a BrokenPipeError from writing the
+                # success response to a disconnected client (common when a
+                # client hard-exits, e.g. stress_test Ctrl+C with daemon
+                # threads) would be mis-attributed to return_process_async
+                # and destroy a process that's already healthy in the pool —
+                # leaving a dead LeanProcess in pool.available_processes for
+                # the next get_process to hand out.
                 try:
-                    server._remove_branches_for_process(process_id)
-                    # Now return to pool - any new client will get a fresh ID
                     server._run_async(
                         server.pool.return_process_async(process),
                         timeout=RETURN_PROCESS_TIMEOUT,
                     )
-                    self._send_json(200, {"status": "ok"})
                 except concurrent.futures.TimeoutError:
                     server.logger.error(
                         f"return_process_async for process {process_id} exceeded "
                         f"{RETURN_PROCESS_TIMEOUT}s — destroying orphaned process to avoid leak"
                     )
-                    if process is not None:
-                        server._destroy_untracked_process(
-                            process, reason=f"return_process_async timed out for process_id={process_id}"
-                        )
+                    server._destroy_untracked_process(
+                        process, reason=f"return_process_async timed out for process_id={process_id}"
+                    )
                     self._send_error(503, "leanserver event loop did not respond in time")
+                    return
                 except Exception as e:
-                    if process is not None:
-                        server._destroy_untracked_process(
-                            process, reason=f"return_process_async raised {type(e).__name__}: {e}"
-                        )
+                    server._destroy_untracked_process(
+                        process, reason=f"return_process_async raised {type(e).__name__}: {e}"
+                    )
                     self._send_error(500, str(e), exception=e)
+                    return
+                # Process is safely back in the pool. A BrokenPipeError here
+                # (client gone) is handled by the outer do_POST wrapper.
+                self._send_json(200, {"status": "ok"})
 
             def _handle_proof_from_sorry(self, process_id: int):
                 with self._process_op_errors(process_id, "proof_from_sorry", DEFAULT_PROOF_FROM_SORRY_TIMEOUT):
