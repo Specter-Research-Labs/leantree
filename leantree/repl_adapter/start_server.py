@@ -36,14 +36,14 @@ def _raise_nofile_soft_limit(target: int = DEFAULT_NOFILE_SOFT_LIMIT) -> None:
         return
     new_soft = min(target, hard)
     if new_soft <= soft:
-        logger.info(f"RLIMIT_NOFILE soft limit already at {soft} (>= requested {target}); leaving as-is")
+        logger.debug(f"RLIMIT_NOFILE soft limit already at {soft} (>= requested {target}); leaving as-is")
         return
     try:
         resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
     except (ValueError, OSError) as e:
         logger.error(f"Could not raise RLIMIT_NOFILE from {soft} to {new_soft}: {e}")
         return
-    logger.info(f"Raised RLIMIT_NOFILE soft limit from {soft} to {new_soft} (hard={hard})")
+    logger.debug(f"Raised RLIMIT_NOFILE soft limit from {soft} to {new_soft} (hard={hard})")
 
 # Terminal settings preservation.
 # The keyboard_monitor thread uses input() to read keypresses, which can modify
@@ -214,7 +214,7 @@ def main():
     # Make `kill -USR1 <pid>` dump a Python traceback for every thread to stderr.
     try:
         faulthandler.register(signal.SIGUSR1, all_threads=True)
-        logger.info("Registered SIGUSR1 handler: kill -USR1 <pid> dumps all-thread tracebacks to stderr")
+        logger.debug("Registered SIGUSR1 handler: kill -USR1 <pid> dumps all-thread tracebacks to stderr")
     except (AttributeError, ValueError, OSError) as e:
         logger.error(f"Could not register SIGUSR1 faulthandler: {e}")
 
