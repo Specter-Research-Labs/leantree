@@ -109,8 +109,9 @@ def keyboard_monitor(address: str, port: int, pool: LeanProcessPool):
                         continue
                     rss_values.append(rss / (1024**3))
                     pss_values.append(pss / (1024**3))
-                print(f"PSS (GB): {' '.join(f'{v:.2f}' for v in pss_values)}")
-                print(f"RSS (GB): {' '.join(f'{v:.2f}' for v in rss_values)}")
+                sorted_pairs = sorted(zip(rss_values, pss_values), key=lambda p: p[0], reverse=True)
+                print(f"PSS (GB): {' '.join(f'{p:.2f}' for _, p in sorted_pairs)}")
+                print(f"RSS (GB): {' '.join(f'{r:.2f}' for r, _ in sorted_pairs)}")
 
                 # Show active requests
                 active_requests = status.get('active_requests', [])
