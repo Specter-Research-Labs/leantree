@@ -219,6 +219,12 @@ class LeanProcess:
                     "allocation exceeded available memory; reduce tactic "
                     "size or raise --max-process-memory-gb"
                 )
+            if "stack overflow detected" in low:
+                return (
+                    "Lean REPL stack overflow during tactic elaboration - "
+                    "pathological tactic (deep combinator nesting / recursive "
+                    "macro); subprocess aborted"
+                )
 
         rc = getattr(self._proc, "returncode", None)
         if rc is None:
