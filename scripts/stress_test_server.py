@@ -230,13 +230,13 @@ def main():
         "--status-interval",
         type=float,
         default=1.0,
-        help="Seconds between status lines (default: 1).",
+        help="Seconds between status lines.",
     )
     parser.add_argument(
         "--tactic-delay",
         type=float,
-        default=0.1,
-        help="Seconds to wait between tactic executions per worker (default: 0.1).",
+        default=0.0,
+        help="Seconds to wait between tactic executions per worker.",
     )
     args = parser.parse_args()
 
