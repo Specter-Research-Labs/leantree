@@ -17,6 +17,8 @@ from leantree.repl_adapter.server import start_server, LeanClient
 from leantree.repl_adapter.process_pool import LeanProcessPool
 
 
+logger = logging.getLogger(__name__)
+
 # The OS default of 1024 is too tight for the REPL subprocesses + concurrent HTTP clients + their transient TIME_WAIT sockets.
 DEFAULT_NOFILE_SOFT_LIMIT = 65536
 
@@ -30,18 +32,18 @@ def _raise_nofile_soft_limit(target: int = DEFAULT_NOFILE_SOFT_LIMIT) -> None:
     try:
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     except (AttributeError, ValueError, OSError) as e:
-        print(f"Could not query RLIMIT_NOFILE: {e}", file=sys.stderr)
+        logger.error(f"Could not query RLIMIT_NOFILE: {e}")
         return
     new_soft = min(target, hard)
     if new_soft <= soft:
-        print(f"RLIMIT_NOFILE soft limit already at {soft} (>= requested {target}); leaving as-is")
+        logger.info(f"RLIMIT_NOFILE soft limit already at {soft} (>= requested {target}); leaving as-is")
         return
     try:
         resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
     except (ValueError, OSError) as e:
-        print(f"Could not raise RLIMIT_NOFILE from {soft} to {new_soft}: {e}", file=sys.stderr)
+        logger.error(f"Could not raise RLIMIT_NOFILE from {soft} to {new_soft}: {e}")
         return
-    print(f"Raised RLIMIT_NOFILE soft limit from {soft} to {new_soft} (hard={hard})", flush=True)
+    logger.info(f"Raised RLIMIT_NOFILE soft limit from {soft} to {new_soft} (hard={hard})")
 
 # Terminal settings preservation.
 # The keyboard_monitor thread uses input() to read keypresses, which can modify
@@ -212,9 +214,9 @@ def main():
     # Make `kill -USR1 <pid>` dump a Python traceback for every thread to stderr.
     try:
         faulthandler.register(signal.SIGUSR1, all_threads=True)
-        print("Registered SIGUSR1 handler: kill -USR1 <pid> dumps all-thread tracebacks to stderr")
+        logger.info("Registered SIGUSR1 handler: kill -USR1 <pid> dumps all-thread tracebacks to stderr")
     except (AttributeError, ValueError, OSError) as e:
-        print(f"Could not register SIGUSR1 faulthandler: {e}", file=sys.stderr)
+        logger.error(f"Could not register SIGUSR1 faulthandler: {e}")
 
     # Determine repl_exe path
     if args.repl_exe:
@@ -225,8 +227,8 @@ def main():
         raise ValueError("REPL executable not specified")
 
     if not repl_exe.exists():
-        print(f"Error: REPL executable not found at {repl_exe}", file=sys.stderr)
-        print("Please specify --repl-exe or set LEAN_REPL_EXE environment variable", file=sys.stderr)
+        logger.error(f"REPL executable not found at {repl_exe}")
+        logger.error("Please specify --repl-exe or set LEAN_REPL_EXE environment variable")
         sys.exit(1)
 
     # Determine project_path
@@ -239,8 +241,8 @@ def main():
         project_path = Path("leantree_project").resolve()
 
     if not project_path.exists():
-        print(f"Error: Project path not found at {project_path}", file=sys.stderr)
-        print("Please specify --project-path or set LEAN_PROJECT_PATH environment variable", file=sys.stderr)
+        logger.error(f"Project path not found at {project_path}")
+        logger.error("Please specify --project-path or set LEAN_PROJECT_PATH environment variable")
         sys.exit(1)
 
     # Prepare imports if requested
@@ -264,17 +266,17 @@ def main():
     )
 
     # Start server
-    print(f"Lean project: {project_path}")
-    print(f"REPL executable: {repl_exe}")
+    logger.info(f"Lean project: {project_path}")
+    logger.info(f"REPL executable: {repl_exe}")
     if args.imports:
-        print(f"Importing packages: {", ".join(args.imports)}")
+        logger.info(f"Importing packages: {", ".join(args.imports)}")
     server = start_server(
         pool,
         address=args.address,
         port=args.port,
         log_level=args.log_level
     )
-    print(f"Server started on http://{args.address}:{args.port} with log level {args.log_level}")
+    logger.info(f"Server started on http://{args.address}:{args.port} with log level {args.log_level}")
 
     # Warmup: pre-start all processes if requested (must be done after server starts to use its event loop)
     if args.warmup:
