@@ -17,7 +17,23 @@ from leantree.utils import RemoteException
 
 
 THEOREM = "example : 1 + 1 = 2 := by sorry"
-TACTICS_NICE = ["skip", "skip", "rfl"]
+
+# Rotation for the `nice` worker: same shape as TACTICS_HOLD below but with
+# list sizes / exponents scaled ~10x down, so each acquire/tactics/return
+# cycle peaks in the low-GB range instead of hold's multi-GB.
+TACTICS_NICE = [
+    "skip",
+    # ~1.2 GB transient: 50M-cons list, length
+    "have _h : (List.range 50000000).length = 50000000 := by native_decide",
+    # ~2.4 GB transient: 100M-element list + fold
+    "have _h : (List.range 100000000).foldl (· + ·) 0 = 4999999950000000 := by native_decide",
+    "skip",
+    # ~3.6 GB transient: 150M-element replicate + fold
+    "have _h : (List.replicate 150000000 1).foldl (· + ·) 0 = 150000000 := by native_decide",
+    # kernel bigint work, lighter than hold's 2^100
+    "have _h : 2 ^ 33 = 8589934592 := by decide",
+    "rfl",
+]
 
 # Rotation for the `hold` worker: each native_decide materializes a huge list
 # at elab time, driving multi-GB transient allocations in the LeanServer.
