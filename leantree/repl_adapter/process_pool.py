@@ -1,10 +1,11 @@
 import time
 import asyncio
+import logging
 from pathlib import Path
 from typing import Callable, Coroutine
 import psutil
 from leantree.repl_adapter.interaction import LeanProcess, LeanEnvironmentCheckpoint
-from leantree.utils import Logger, NullLogger, to_sync
+from leantree.utils import to_sync
 
 
 class LeanProcessPool:
@@ -22,7 +23,7 @@ class LeanProcessPool:
             project_path: Path,
             max_processes: int,
             env_setup_async: Callable[[LeanProcess], Coroutine] | None = None,
-            logger: Logger | None = None,
+            logger: logging.Logger | None = None,
             rss_hard_limit: int | None = 32 * 1024 ** 3,
             pss_recycle_limit: int | None = 4 * 1024 ** 3,
     ):
@@ -53,7 +54,7 @@ class LeanProcessPool:
         self.max_processes = max_processes
         self.rss_hard_limit = rss_hard_limit
         self.pss_recycle_limit = pss_recycle_limit
-        self.logger = logger if logger else NullLogger()
+        self.logger = logger if logger else logging.getLogger(__name__)
 
         # Pool state
         self.available_processes: list[LeanProcess] = []

@@ -149,13 +149,10 @@ class LeanServer:
         self.server = None
         self.server_thread = None
 
-        # Setup logger
+        # Root handler + formatter come from leantree.utils.setup_default_logging;
+        # just lower this named logger's threshold if requested.
         self.logger = logging.getLogger("LeanServer")
         self.logger.setLevel(log_level)
-        if not self.logger.handlers:
-            handler = logging.StreamHandler()
-            handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-            self.logger.addHandler(handler)
 
         # Process tracking: encapsulates id<->process bidirectional map and
         # last-used timestamps in one lock; see _ProcessRegistry.

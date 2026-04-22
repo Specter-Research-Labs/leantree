@@ -259,7 +259,7 @@ class Verifier:
         self.repl = LeanProcess(
             self.args.repl_exe,
             self.args.project_path,
-            # utils.Logger(utils.LogLevel.DEBUG),
+            # logging.getLogger("leantree.whole_proof_generation.repl"),
         )
         await self.repl.start_async()
         await self.repl.send_command_async(MINIF2F_HEADER)

@@ -22,7 +22,6 @@ released + checkpoint evicted.
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -34,7 +33,6 @@ except ImportError:
 
 from leantree.repl_adapter.process_pool import LeanProcessPool
 from leantree.repl_adapter.interaction import LeanEnvironmentCheckpoint
-from leantree.utils import Logger, LogLevel
 
 
 def _make_pool(max_process_memory_bytes: int | None, recycle_ratio: float = 0.5):
@@ -44,7 +42,7 @@ def _make_pool(max_process_memory_bytes: int | None, recycle_ratio: float = 0.5)
         max_processes=4,
         max_process_memory_bytes=max_process_memory_bytes,
         recycle_memory_ratio=recycle_ratio,
-        logger=Logger(LogLevel.INFO),
+        logger=logging.getLogger("test_proactive_recycle"),
     )
     return pool
 
@@ -106,18 +104,9 @@ def test_recycle_log_contains_pss_threshold_and_rlimit():
     rlimit = 32 * 1024**3
     pool = _make_pool(max_process_memory_bytes=rlimit, recycle_ratio=0.5)
 
-    # Capture INFO-level log output from the server's logger
-    log_stream = io.StringIO()
-    log_handler = logging.StreamHandler(log_stream)
-    log_handler.setLevel(logging.INFO)
-    py_logger = logging.getLogger("leantree")
-    py_logger.setLevel(logging.INFO)
-    py_logger.addHandler(log_handler)
-    # Also patch the pool.logger to emit through logging
-    pool.logger = Logger(LogLevel.INFO)
-
-    # Replace logger.info with a capturing shim
+    # Replace pool.logger.info with a capturing shim
     messages: list[str] = []
+    pool.logger = logging.getLogger("test_proactive_recycle_capture")
     pool.logger.info = messages.append
 
     process = _make_mock_process(pss_bytes=24 * 1024**3)  # 24 GiB = 75% of 32 GiB cap

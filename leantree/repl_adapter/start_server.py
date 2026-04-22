@@ -3,6 +3,7 @@
 import argparse
 import atexit
 import faulthandler
+import logging
 import os
 import resource
 import signal
@@ -14,7 +15,6 @@ import time
 
 from leantree.repl_adapter.server import start_server, LeanClient
 from leantree.repl_adapter.process_pool import LeanProcessPool
-from leantree.utils import Logger, LogLevel
 
 
 # The OS default of 1024 is too tight for the REPL subprocesses + concurrent HTTP clients + their transient TIME_WAIT sockets.
@@ -131,6 +131,10 @@ def main():
 
     args = parser.parse_args()
 
+    # Apply --log-level to the root logger so every module-level logger
+    # (process_pool, interaction, server, ...) inherits it.
+    logging.getLogger().setLevel(args.log_level)
+
     # FD limit must be raised BEFORE the HTTP socket is opened or any subprocess
     # is spawned, so do it as early as possible after argparse.
     _raise_nofile_soft_limit()
@@ -182,7 +186,6 @@ def main():
         repl_exe=repl_exe,
         project_path=project_path,
         max_processes=args.max_processes,
-        logger=Logger(LogLevel.DEBUG) if args.log_level == "DEBUG" else None,
         env_setup_async=env_setup_async,
     )
 

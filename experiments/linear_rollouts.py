@@ -2,6 +2,7 @@ import argparse
 from collections import defaultdict
 import json
 import copy
+import logging
 import time
 import multiprocessing
 from pathlib import Path
@@ -572,7 +573,7 @@ async def start_repls(args: argparse.Namespace, rollouts: list[RolloutProofSearc
         repl = LeanProcess(
             args.repl_exe,
             args.project_path,
-            utils.Logger(utils.LogLevel.DEBUG),
+            logging.getLogger("leantree.linear_rollouts.repl"),
         )
         await repl.start_async()
         await repl.send_command_async(MINIF2F_HEADER)

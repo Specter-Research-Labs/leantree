@@ -3,17 +3,54 @@ import asyncio
 import base64
 import datetime
 import functools
+import logging
 import os
 import pickle
 import re
 import traceback
-from enum import Enum
 from pathlib import Path
 from typing import Set, Callable, AsyncIterator, Self
 
 from PrettyPrint import PrettyPrintTree
 
 from leantree.file_span import FileSpan
+
+
+class ColoredFormatter(logging.Formatter):
+    """Custom formatter that adds colors to log messages."""
+    # ANSI color codes
+    COLORS = {
+        'DEBUG': '\033[36m',    # Cyan
+        'INFO': '\033[32m',     # Green
+        'WARNING': '\033[33m',  # Yellow
+        'ERROR': '\033[31m',    # Red
+        'CRITICAL': '\033[35m', # Magenta
+    }
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+
+    def format(self, record):
+        levelname = record.levelname
+        if levelname in self.COLORS:
+            record.levelname = f"{self.COLORS[levelname]}{self.BOLD}{levelname}{self.RESET}"
+        message = super().format(record)
+        if levelname == 'INFO':
+            message = re.sub(r'(\d+\.?\d*\s*(?:GB|MB|%|docs))', rf'{self.BOLD}\1{self.RESET}', message)
+            message = re.sub(r'(Shard \d+)', rf'{self.COLORS["INFO"]}{self.BOLD}\1{self.RESET}', message)
+        return message
+
+
+def setup_default_logging():
+    handler = logging.StreamHandler()
+    handler.setFormatter(ColoredFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=[handler],
+    )
+
+
+setup_default_logging()
+logger = logging.getLogger(__name__)
 
 
 # TODO: have a look at torch._utils.ExceptionWrapper
@@ -335,64 +372,6 @@ class ValueOrError[SomeValue]:
     def error(self) -> SomeValue:
         assert not self.is_success()
         return self._error
-
-
-class LogLevel(Enum):
-    SUPPRESS = 0
-    SUPPRESS_AND_STORE = 1
-    INFO = 2
-    DEBUG = 3
-
-
-# TODO: replace with something built-in
-class Logger:
-    def __init__(self, log_level: LogLevel):
-        self.log_level = log_level
-        self._stored_messages = None
-        if log_level == LogLevel.SUPPRESS_AND_STORE:
-            self._stored_messages = []
-
-    def info(self, msg: str):
-        if self.log_level in [LogLevel.INFO, LogLevel.DEBUG]:
-            print(msg)
-        elif self.log_level == LogLevel.SUPPRESS_AND_STORE:
-            self._stored_messages.append((msg, LogLevel.INFO))
-
-    warning = info
-
-    def debug(self, msg: str):
-        if self.log_level == LogLevel.DEBUG:
-            print(msg)
-        elif self.log_level == LogLevel.SUPPRESS_AND_STORE:
-            self._stored_messages.append((msg, LogLevel.DEBUG))
-
-    def print_stored(self, log_level: LogLevel):
-        assert log_level in [LogLevel.INFO, LogLevel.DEBUG]
-        for msg, msg_level in self._stored_messages:
-            if log_level.value >= msg_level.value:
-                print(msg)
-        self.delete_stored()
-
-    def delete_stored(self):
-        assert self._stored_messages is not None
-        self._stored_messages = []
-
-
-class NullLogger(Logger):
-    def __init__(self):
-        super().__init__(LogLevel.SUPPRESS)
-
-    def info(self, msg: str):
-        pass
-
-    def debug(self, msg: str):
-        pass
-
-    def print_stored(self, log_level: LogLevel):
-        pass
-
-    def delete_stored(self):
-        pass
 
 
 # TODO: unit test

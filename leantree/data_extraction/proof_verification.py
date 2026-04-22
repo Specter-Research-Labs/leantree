@@ -1,6 +1,6 @@
+import logging
 from pathlib import Path
 
-from leantree import utils
 from leantree.core.lean import LeanProofState
 from leantree.core.lean_file import LeanTacticBlock, LeanFile
 from leantree.data_extraction.proof_tree import ProofTreeNode, ProofTree
@@ -8,7 +8,7 @@ from leantree.environment.interaction import LeanEnvironment, LeanInteractionExc
 
 
 class ProofTreeVerifier:
-    def __init__(self, project_path: Path, lean_repl_exe: Path, logger: utils.Logger):
+    def __init__(self, project_path: Path, lean_repl_exe: Path, logger: logging.Logger):
         self.project_path = project_path
         self.lean_repl_exe = lean_repl_exe
         self.logger = logger

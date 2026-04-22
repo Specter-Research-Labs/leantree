@@ -1,10 +1,10 @@
 from typing import Self
+import logging
 import shutil
 import subprocess
 from pathlib import Path
 from dataclasses import dataclass, replace
 
-from leantree import utils
 from leantree.core.lean_file import LeanFile, LeanTheorem, LeanTacticBlock, StoredError
 from leantree.data_extraction.tree_builder import ProofTreeBuilder
 from leantree.data_extraction.tree_postprocessor import ProofTreePostprocessor
@@ -21,7 +21,7 @@ class LeanProject:
             *,
             repl_path: Path | str | None = None,
             create: bool = False,
-            logger: utils.Logger | None = None,
+            logger: logging.Logger | None = None,
     ):
         self.path = Path(path) if path else Path("leantree_project")
         if not self.path.exists():
@@ -157,7 +157,7 @@ class LeanProject:
             lean_version: str | None = "v4.19.0",
             *,
             repl_path: Path | str | None = None,
-            logger: utils.Logger | None = None,
+            logger: logging.Logger | None = None,
             suppress_output: bool = False,
             libraries: "list[LeanLibrary | str] | None" = None,
     ) -> Self:

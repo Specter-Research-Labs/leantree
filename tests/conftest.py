@@ -1,9 +1,9 @@
+import logging
 import tempfile
 from pathlib import Path
 import pytest
 
 from leantree import LeanProject
-from leantree.utils import Logger, LogLevel
 
 REPL_EXE = Path("../lean-repl/.lake/build/bin/repl")
 
@@ -14,7 +14,9 @@ def fixture_project():
         raise FileNotFoundError(
             f"Project path {project_path} does not exist. Please follow the Development section in README to create it."
         )
-    project = LeanProject(project_path, repl_path=REPL_EXE, logger=Logger(LogLevel.DEBUG))
+    test_logger = logging.getLogger("leantree.test_project")
+    test_logger.setLevel(logging.DEBUG)
+    project = LeanProject(project_path, repl_path=REPL_EXE, logger=test_logger)
     yield project
 
 

@@ -2,6 +2,7 @@ import asyncio
 import ctypes
 import ctypes.util
 import json
+import logging
 import os
 import re
 import resource
@@ -168,13 +169,13 @@ class LeanProcess:
         self,
         repl_exe: Path,
         project_path: Path,
-        logger: utils.Logger = None,
+        logger: logging.Logger | None = None,
         pool: Any = None,
         rss_hard_limit: int | None = None,
     ):
         self.repl_exe = repl_exe
         self.project_path = project_path
-        self.logger = logger if logger else utils.NullLogger()
+        self.logger = logger if logger else logging.getLogger(__name__)
         self.pool = pool
         # Hard per-subprocess address-space ceiling enforced via RLIMIT_AS in
         # ``start_async``'s preexec_fn.  ``None`` disables the limit.

@@ -1,7 +1,8 @@
-from leantree import LeanProject, StoredError
-from leantree import utils
+import logging
 
-project = LeanProject(create=True, logger=utils.Logger(utils.LogLevel.INFO))
+from leantree import LeanProject, StoredError
+
+project = LeanProject(create=True, logger=logging.getLogger("leantree.examples.parse_file"))
 file = project.load_file("Example3.lean", use_cache=False)
 
 for thm in file.theorems:
