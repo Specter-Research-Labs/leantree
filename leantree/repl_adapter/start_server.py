@@ -68,6 +68,64 @@ def _restore_terminal():
 atexit.register(_restore_terminal)
 
 
+def keyboard_monitor(address: str, port: int, pool: LeanProcessPool):
+    """Print server status (and per-process RSS/PSS) each time the user hits Enter."""
+    client = LeanClient(address, port)
+    while True:
+        try:
+            input()  # Wait for Enter key
+            try:
+                status = client.check_status()
+                print(f"\n=== Server Status ===")
+                print(f"Processes: {status['available_processes']} available, "
+                      f"{status['used_processes']} used, "
+                      f"{status['starting_processes']} starting, "
+                      f"{status['max_processes']} max")
+                print(f"RAM: {status['ram']['percent']:.1f}% used "
+                      f"({status['ram']['used_bytes'] / (1024**3):.1f}GB / "
+                      f"{status['ram']['total_bytes'] / (1024**3):.1f}GB)")
+                avg_cpu = sum(status['cpu_percent_per_core']) / len(status['cpu_percent_per_core'])
+                print(f"CPU: {avg_cpu:.1f}% average across {len(status['cpu_percent_per_core'])} cores")
+
+                # Show inactive processes and branches
+                inactive_proc = status.get('inactive_processes', 0)
+                total_proc = status.get('total_tracked_processes', 0)
+                inactive_br = status.get('inactive_branches', 0)
+                total_br = status.get('total_branches', 0)
+                print(f"Inactive (>60s): {inactive_proc}/{total_proc} processes, {inactive_br}/{total_br} branches")
+
+                # Per-process memory. Snapshot pool.checkpoints.keys() so we don't iterate
+                # a dict being mutated by the event loop. Skip processes that fail to report
+                # (may be mid-shutdown) and keep RSS/PSS aligned by appending together.
+                rss_values: list[float] = []
+                pss_values: list[float] = []
+                for process in list(pool.checkpoints.keys()):
+                    try:
+                        rss = process.memory_usage_rss()
+                        pss = process.memory_usage_pss()
+                    except Exception:
+                        continue
+                    rss_values.append(rss / (1024**3))
+                    pss_values.append(pss / (1024**3))
+                print(f"PSS (GB): {' '.join(f'{v:.2f}' for v in pss_values)}")
+                print(f"RSS (GB): {' '.join(f'{v:.2f}' for v in rss_values)}")
+
+                # Show active requests
+                active_requests = status.get('active_requests', [])
+                if active_requests:
+                    print(f"Active requests ({len(active_requests)}):")
+                    for req in active_requests:
+                        print(f"  - {req['path']} ({req['duration_seconds']}s, thread: {req['thread']})")
+                else:
+                    print("Active requests: none")
+                print()
+            except Exception as e:
+                print(f"Error getting status: {e}")
+        except EOFError:
+            # stdin closed, exit the thread
+            break
+
+
 def main():
     """CLI entry point for the Lean server."""
     # Line-buffer stdout so nohup-redirected log files show diagnostic prints immediately (RLIMIT_NOFILE raise, RLIMIT_AS
@@ -128,6 +186,18 @@ def main():
         action="store_true",
         help="Pre-start all processes to max capacity before accepting requests"
     )
+    parser.add_argument(
+        "--rss-hard-limit-gib",
+        type=float,
+        default=32.0,
+        help="Per-subprocess RLIMIT_AS ceiling in GiB; <=0 disables (default: 32)"
+    )
+    parser.add_argument(
+        "--pss-recycle-limit-gib",
+        type=float,
+        default=4.0,
+        help="Recycle a process whose PSS on return exceeds this, in GiB; <=0 disables (default: 4)"
+    )
 
     args = parser.parse_args()
 
@@ -182,11 +252,15 @@ def main():
         env_setup_async = setup_imports
 
     # Create process pool
+    rss_hard_limit = int(args.rss_hard_limit_gib * 1024**3) if args.rss_hard_limit_gib > 0 else None
+    pss_recycle_limit = int(args.pss_recycle_limit_gib * 1024**3) if args.pss_recycle_limit_gib > 0 else None
     pool = LeanProcessPool(
         repl_exe=repl_exe,
         project_path=project_path,
         max_processes=args.max_processes,
         env_setup_async=env_setup_async,
+        rss_hard_limit=rss_hard_limit,
+        pss_recycle_limit=pss_recycle_limit,
     )
 
     # Start server
@@ -204,9 +278,7 @@ def main():
 
     # Warmup: pre-start all processes if requested (must be done after server starts to use its event loop)
     if args.warmup:
-        print(f"Warming up {args.max_processes} processes...")
         server._run_async(pool.max_out_processes_async())
-        print("Warmup complete.")
 
     # Handle shutdown gracefully
     _shutting_down = False
@@ -228,47 +300,11 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     # Start keyboard monitoring thread
-    def keyboard_monitor():
-        client = LeanClient(args.address, args.port)
-        while True:
-            try:
-                input()  # Wait for Enter key
-                try:
-                    status = client.check_status()
-                    print(f"\n=== Server Status ===")
-                    print(f"Processes: {status['available_processes']} available, "
-                          f"{status['used_processes']} used, "
-                          f"{status['starting_processes']} starting, "
-                          f"{status['max_processes']} max")
-                    print(f"RAM: {status['ram']['percent']:.1f}% used "
-                          f"({status['ram']['used_bytes'] / (1024**3):.1f}GB / "
-                          f"{status['ram']['total_bytes'] / (1024**3):.1f}GB)")
-                    avg_cpu = sum(status['cpu_percent_per_core']) / len(status['cpu_percent_per_core'])
-                    print(f"CPU: {avg_cpu:.1f}% average across {len(status['cpu_percent_per_core'])} cores")
-                    
-                    # Show inactive processes and branches
-                    inactive_proc = status.get('inactive_processes', 0)
-                    total_proc = status.get('total_tracked_processes', 0)
-                    inactive_br = status.get('inactive_branches', 0)
-                    total_br = status.get('total_branches', 0)
-                    print(f"Inactive (>60s): {inactive_proc}/{total_proc} processes, {inactive_br}/{total_br} branches")
-                    
-                    # Show active requests
-                    active_requests = status.get('active_requests', [])
-                    if active_requests:
-                        print(f"Active requests ({len(active_requests)}):")
-                        for req in active_requests:
-                            print(f"  - {req['path']} ({req['duration_seconds']}s, thread: {req['thread']})")
-                    else:
-                        print("Active requests: none")
-                    print()
-                except Exception as e:
-                    print(f"Error getting status: {e}")
-            except EOFError:
-                # stdin closed, exit the thread
-                break
-
-    keyboard_thread = threading.Thread(target=keyboard_monitor, daemon=True)
+    keyboard_thread = threading.Thread(
+        target=keyboard_monitor,
+        args=(args.address, args.port, pool),
+        daemon=True,
+    )
     keyboard_thread.start()
     print("Press Enter to show server status")
 
