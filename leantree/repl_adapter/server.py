@@ -102,6 +102,19 @@ class _ProcessRegistry:
             self._last_used.pop(process_id, None)
             return process
 
+    def touch(self, process_id: int) -> None:
+        """Refresh last-used for ``process_id`` if tracked. No-op otherwise.
+
+        Needed because branch-only handlers (``try_apply_tactic``,
+        ``branch_state``) access the process indirectly via ``_get_branch``
+        and would otherwise never update the process's ``_last_used``,
+        letting the reaper reclaim a process that is being actively
+        hammered with tactics (e.g. under ``--tactic-delay``).
+        """
+        with self._lock:
+            if process_id in self._last_used:
+                self._last_used[process_id] = time.time()
+
     def __contains__(self, process_id: int) -> bool:
         with self._lock:
             return process_id in self._id_to_process
@@ -325,7 +338,12 @@ class LeanServer:
             if key not in self._branches:
                 raise ValueError(f"Branch {branch_id} not found for process {process_id}")
             self._branch_last_used[key] = time.time()
-            return self._branches[key]
+            branch = self._branches[key]
+        # Refresh the process's _last_used too — otherwise a worker that only
+        # hits try_apply_tactic / branch/state (never _get_process) can have
+        # its process reaped out from under it.
+        self._processes.touch(process_id)
+        return branch
 
     def _remove_branches_for_process(self, process_id: int):
         """Remove all branches associated with a process."""
@@ -665,12 +683,7 @@ class LeanServer:
                 # Get RAM utilization
                 memory = psutil.virtual_memory()
 
-                # Leanserver Python-process RSS.  A sudden growth here is
-                # a memory leak in our own code (observed: h5 grew to 110
-                # GiB while h4 stayed at 50 MB under identical workload —
-                # root cause still under investigation).  Exposing this
-                # per-poll makes the growth observable externally without
-                # having to SSH in and run `ps`.
+                # Leanserver Python-process RSS. A sudden growth here is a memory leak in our own code.
                 try:
                     self_rss_bytes = psutil.Process().memory_info().rss
                 except Exception:
@@ -715,7 +728,7 @@ class LeanServer:
                     },
                     # Python-process-level RSS for the leanserver itself.
                     # Grow-over-time here signals a leak in our own code;
-                    # see the note in _handle_status.  None if unavailable.
+                    # see the note in _handle_status. None if unavailable.
                     "leanserver_rss_bytes": self_rss_bytes,
                     "inactive_processes": inactive_processes,
                     "total_tracked_processes": total_tracked_processes,
