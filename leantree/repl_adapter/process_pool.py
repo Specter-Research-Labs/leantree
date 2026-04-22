@@ -152,17 +152,10 @@ class LeanProcessPool:
             if track_starting:
                 self._num_starting_processes -= 1
 
-    async def max_out_processes_async(self, batch_size: int | None = None):
+    async def max_out_processes_async(self):
         """
         Start processes in parallel until we reach max_processes capacity.
-
-        This method ensures that len(self.available_processes) + self._num_used_processes
-        equals self.max_processes by starting new processes in parallel.
-
-        Args:
-            batch_size: If set, start processes in batches of this size to limit
-                        resource contention (useful when env_setup is expensive).
-                        ``None`` means start all at once.
+        This method ensures that len(self.available_processes) + self._num_used_processes equals self.max_processes by starting new processes in parallel.
         """
         async with self.lock:
             processes_to_start = self.max_processes - (len(self.available_processes) + self._num_used_processes)
@@ -170,31 +163,14 @@ class LeanProcessPool:
                 return
             self.logger.info(f"Starting {processes_to_start} processes in parallel")
 
-        if batch_size is not None and batch_size < processes_to_start:
-            remaining = processes_to_start
-            while remaining > 0:
-                current_batch = min(batch_size, remaining)
-                self.logger.info(f"Starting batch of {current_batch} processes ({processes_to_start - remaining}/{processes_to_start} done)")
-                tasks = [self._create_process_async() for _ in range(current_batch)]
-                new_processes = await asyncio.gather(*tasks)
-                async with self.lock:
-                    self.available_processes.extend(new_processes)
-                    if self.available_processes:
-                        self.process_available_event.set()
-                remaining -= current_batch
-            self.logger.info(
-                f"Started {processes_to_start} processes. Available: {len(self.available_processes)}, Used: {self._num_used_processes}")
-        else:
-            # Create processes OUTSIDE the lock
-            tasks = [self._create_process_async() for _ in range(processes_to_start)]
-            new_processes = await asyncio.gather(*tasks)
+        tasks = [self._create_process_async() for _ in range(processes_to_start)]
+        new_processes = await asyncio.gather(*tasks)
 
-            async with self.lock:
-                self.available_processes.extend(new_processes)
-                if self.available_processes:
-                    self.process_available_event.set()
-                self.logger.info(
-                    f"Started {len(new_processes)} processes. Available: {len(self.available_processes)}, Used: {self._num_used_processes}")
+        async with self.lock:
+            self.available_processes.extend(new_processes)
+            if self.available_processes:
+                self.process_available_event.set()
+            self.logger.info(f"Started {len(new_processes)} processes. Available: {len(self.available_processes)}, Used: {self._num_used_processes}")
 
     async def _get_or_create_process_async(self) -> LeanProcess | None:
         """Try to get an available process or reserve a slot and create one.

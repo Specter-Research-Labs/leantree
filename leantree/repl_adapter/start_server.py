@@ -2,10 +2,7 @@
 
 import argparse
 import atexit
-import ctypes
-import ctypes.util
 import faulthandler
-import logging
 import os
 import resource
 import signal
@@ -13,49 +10,14 @@ import sys
 import termios
 import threading
 from pathlib import Path
+import time
 
 from leantree.repl_adapter.server import start_server, LeanClient
 from leantree.repl_adapter.process_pool import LeanProcessPool
 from leantree.utils import Logger, LogLevel
 
 
-# prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY) — allows any same-uid process to
-# attach via ptrace (py-spy, gdb, strace).  Required on hosts that have
-# /proc/sys/kernel/yama/ptrace_scope = 1 (default on Ubuntu), where by
-# default only a direct parent can ptrace.  With this call at startup,
-# `py-spy dump --pid <leanserver>` and `py-spy record` work without sudo.
-# Security note: this is only a concern on shared hosts where another user
-# could gain our uid; on dedicated compute nodes where the leanserver runs
-# under our own account and no untrusted code runs as the same user, this
-# is safe.  See prctl(2).
-_PR_SET_PTRACER = 0x59616D61  # PR_SET_PTRACER
-_PR_SET_PTRACER_ANY = 0xFFFFFFFFFFFFFFFF  # (pid_t)-1 as unsigned
-
-
-def _allow_ptrace_from_same_uid() -> None:
-    """Permit py-spy / gdb attach from any same-uid process.
-
-    No-op on non-Linux (prctl unavailable) or if libc can't be found.
-    """
-    libc_path = ctypes.util.find_library("c") or "libc.so.6"
-    try:
-        libc = ctypes.CDLL(libc_path, use_errno=True)
-    except OSError as e:
-        print(f"Could not open libc to call prctl(PR_SET_PTRACER): {e}", file=sys.stderr, flush=True)
-        return
-    rc = libc.prctl(_PR_SET_PTRACER, ctypes.c_ulong(_PR_SET_PTRACER_ANY), 0, 0, 0)
-    if rc == 0:
-        print("prctl(PR_SET_PTRACER, ANY) OK: py-spy / gdb can now attach without sudo", flush=True)
-    else:
-        errno = ctypes.get_errno()
-        print(f"prctl(PR_SET_PTRACER, ANY) returned {rc} (errno={errno}); py-spy attach may need sudo",
-              file=sys.stderr, flush=True)
-
-
-# Default soft limit for open file descriptors.  The OS default of 1024 is too
-# tight for ~62 lake/repl subprocesses + ~125 concurrent HTTP clients + their
-# transient TIME_WAIT sockets.  We've observed FD exhaustion (Errno 24) at
-# 1024 in production; 65536 leaves headroom for >5x the steady-state load.
+# The OS default of 1024 is too tight for the REPL subprocesses + concurrent HTTP clients + their transient TIME_WAIT sockets.
 DEFAULT_NOFILE_SOFT_LIMIT = 65536
 
 
@@ -81,8 +43,7 @@ def _raise_nofile_soft_limit(target: int = DEFAULT_NOFILE_SOFT_LIMIT) -> None:
         return
     print(f"Raised RLIMIT_NOFILE soft limit from {soft} to {new_soft} (hard={hard})", flush=True)
 
-# Terminal settings preservation
-# ----------------------------
+# Terminal settings preservation.
 # The keyboard_monitor thread uses input() to read keypresses, which can modify
 # terminal settings (e.g., disabling echo mode). If the process is killed via
 # Ctrl+C while input() is active, these settings may not be restored, leaving
@@ -109,10 +70,9 @@ atexit.register(_restore_terminal)
 
 def main():
     """CLI entry point for the Lean server."""
-    # Line-buffer stdout so nohup-redirected log files show diagnostic prints
-    # immediately (RLIMIT_NOFILE raise, RLIMIT_AS default, warmup progress,
-    # SIGUSR1 registration) rather than waiting for block-buffer flush.
-    # Without this, empty log files mid-run masked useful startup info.
+    # Line-buffer stdout so nohup-redirected log files show diagnostic prints immediately (RLIMIT_NOFILE raise, RLIMIT_AS
+    # default, warmup progress, SIGUSR1 registration) rather than waiting for block-buffer flush. Without this, empty log
+    # files mid-run masked useful startup info.
     try:
         sys.stdout.reconfigure(line_buffering=True)
         sys.stderr.reconfigure(line_buffering=True)
@@ -169,20 +129,6 @@ def main():
         help="Pre-start all processes to max capacity before accepting requests"
     )
     parser.add_argument(
-        "--warmup-batch-size",
-        type=int,
-        default=16,
-        help=(
-            "Start warmup processes in batches of this size to limit resource "
-            "contention (default: 16). Starting all 62 parallel `lake env repl` "
-            "processes simultaneously thunders the CPU (62 Mathlib inits on 64 "
-            "cores), which causes individual imports to miss the 300s response "
-            "deadline and blows up warmup. 16 at a time keeps load ~reasonable "
-            "and finishes in ~4 minutes. Use 0 to disable batching (old "
-            "all-at-once behavior), or a larger number if the host is idle."
-        ),
-    )
-    parser.add_argument(
         "--max-process-memory-gb",
         type=float,
         default=32.0,
@@ -191,7 +137,7 @@ def main():
             "address space exceeds this, the kernel SIGKILLs the subprocess "
             "cleanly; the pool's existing poisoned-process logic swaps in a "
             "fresh one. 0 disables the limit (not recommended in production). "
-            "8 GiB was experimentally too tight for Mathlib — Lean's "
+            "8 GiB was experimentally too tight for Mathlib - Lean's "
             "multi-threaded runtime allocates pthread stacks via mmap and the "
             "address space fills quickly even before tactics execute, so the "
             "leanserver fails to create its worker threads. 32 GiB is "
@@ -206,20 +152,7 @@ def main():
     # is spawned, so do it as early as possible after argparse.
     _raise_nofile_soft_limit()
 
-    # Opt-in to being ptrace-able by any same-uid process.  On hosts with
-    # /proc/sys/kernel/yama/ptrace_scope = 1 (default on Ubuntu), only a
-    # direct parent can attach via ptrace; py-spy / gdb / strace then
-    # fail with "Permission Denied" unless run as root.  Calling
-    # prctl(PR_SET_PTRACER, ANY) here lifts that restriction for this
-    # specific process, so we can attach diagnostic tools on demand
-    # without SSH'ing in as root.  See prctl(2).
-    _allow_ptrace_from_same_uid()
-
-    # Make `kill -USR1 <pid>` dump a Python traceback for every thread to
-    # stderr.  Pure diagnostic surface — does not affect normal operation.  The
-    # bounded `_run_async` timeouts in server.py mean the leanserver shouldn't
-    # actually wedge in production, but if it ever does this is how we learn
-    # what's stuck without having to attach gdb.
+    # Make `kill -USR1 <pid>` dump a Python traceback for every thread to stderr.
     try:
         faulthandler.register(signal.SIGUSR1, all_threads=True)
         print("Registered SIGUSR1 handler: kill -USR1 <pid> dumps all-thread tracebacks to stderr")
@@ -253,31 +186,25 @@ def main():
         print("Please specify --project-path or set LEAN_PROJECT_PATH environment variable", file=sys.stderr)
         sys.exit(1)
 
-    # Create process pool
+    # Prepare imports if requested
     env_setup_async = None
     if args.imports:
         async def setup_imports(process):
             imports_str = "\n".join(f"import {imp}" for imp in args.imports)
-            # Default 300s timeout is fine here: with --warmup-batch-size
-            # keeping CPU contention bounded, Mathlib + FormalConjectures
-            # imports finish in <1 min per batch.  Keeping the default
-            # means the timeout still serves as a real deadlock safety
-            # net — a hung import fails fast instead of stalling warmup
-            # for 30 min.
             await process.send_command_async(imports_str)
         env_setup_async = setup_imports
 
+    # Compute RLIMIT_AS if requested
     max_process_memory_bytes = (
-        int(args.max_process_memory_gb * 1024 ** 3) if args.max_process_memory_gb > 0 else None
+        int(args.max_process_memory_gb * 1024 ** 3) if args.max_process_memory_gb != 0 else None
     )
     if max_process_memory_bytes is not None:
         print(
             f"Per-process RLIMIT_AS: {args.max_process_memory_gb} GiB "
-            f"({max_process_memory_bytes} bytes) — runaway tactics will be SIGKILLed by the kernel"
+            f"({max_process_memory_bytes} bytes) - runaway tactics will be SIGKILLed by the kernel"
         )
-    else:
-        print("Per-process RLIMIT_AS: DISABLED (--max-process-memory-gb=0)")
 
+    # Create process pool
     pool = LeanProcessPool(
         repl_exe=repl_exe,
         project_path=project_path,
@@ -288,27 +215,23 @@ def main():
     )
 
     # Start server
+    print(f"Lean project: {project_path}")
+    print(f"REPL executable: {repl_exe}")
+    if args.imports:
+        print(f"Importing packages: {", ".join(args.imports)}")
     server = start_server(
         pool,
         address=args.address,
         port=args.port,
         log_level=args.log_level
     )
-
-    # Warmup: pre-start all processes if requested (must be after server starts to use its event loop)
-    if args.warmup:
-        batch_size = args.warmup_batch_size
-        if batch_size:
-            print(f"Warming up {args.max_processes} processes in batches of {batch_size}...")
-        else:
-            print(f"Warming up {args.max_processes} processes...")
-        server._run_async(pool.max_out_processes_async(batch_size=batch_size))
-        print("Warmup complete.")
-    print(f"Lean project: {project_path}")
-    print(f"REPL executable: {repl_exe}")
-    if args.imports:
-        print(f"Importing packages: {", ".join(args.imports)}")
     print(f"Server started on http://{args.address}:{args.port} with log level {args.log_level}")
+
+    # Warmup: pre-start all processes if requested (must be done after server starts to use its event loop)
+    if args.warmup:
+        print(f"Warming up {args.max_processes} processes...")
+        server._run_async(pool.max_out_processes_async())
+        print("Warmup complete.")
 
     # Handle shutdown gracefully
     _shutting_down = False
@@ -321,9 +244,8 @@ def main():
             os._exit(1)
         _shutting_down = True
         print("\nShutting down server... (press Ctrl+C again to force quit)")
-        # server.stop() handles both checked-out and idle processes
+        # server.stop() stops both checked-out and available processes
         server.stop()
-        # Restore terminal settings (input() in keyboard_monitor can leave terminal in bad state)
         _restore_terminal()
         sys.exit(0)
 
@@ -354,8 +276,7 @@ def main():
                     total_proc = status.get('total_tracked_processes', 0)
                     inactive_br = status.get('inactive_branches', 0)
                     total_br = status.get('total_branches', 0)
-                    print(f"Inactive (>60s): {inactive_proc}/{total_proc} processes, "
-                          f"{inactive_br}/{total_br} branches")
+                    print(f"Inactive (>60s): {inactive_proc}/{total_proc} processes, {inactive_br}/{total_br} branches")
                     
                     # Show active requests
                     active_requests = status.get('active_requests', [])
@@ -377,7 +298,6 @@ def main():
     print("Press Enter to show server status")
 
     try:
-        import time
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
