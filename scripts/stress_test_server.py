@@ -19,6 +19,25 @@ from leantree.utils import RemoteException
 THEOREM = "example : 1 + 1 = 2 := by sorry"
 TACTICS_NICE = ["skip", "skip", "rfl"]
 
+# Rotation for the `hold` worker: each native_decide materializes a huge list
+# at elab time, driving multi-GB transient allocations in the LeanServer.
+# With many workers hitting heavy steps concurrently, peak RSS easily exceeds
+# physical RAM — tune sizes down (or worker count) if the box OOMs.
+TACTICS_HOLD = [
+    "skip",
+    # ~12 GB transient: 500M-cons list, traverse to length
+    "have _h : (List.range 500000000).length = 500000000 := by native_decide",
+    # ~24 GB transient: 1B-cons list + fold
+    "have _h : (List.range 1000000000).foldl (· + ·) 0 = 499999999500000000 := by native_decide",
+    "skip",
+    # ~36 GB transient: 1.5B-element replicate + fold
+    "have _h : (List.replicate 1500000000 1).foldl (· + ·) 0 = 1500000000 := by native_decide",
+    # kernel bigint work on ~100-bit Nat
+    "have _h : 2 ^ 100 = 1267650600228229401496703205376 := by decide",
+    "skip",
+    "rfl",
+]
+
 
 class Counters:
     def __init__(self):
@@ -144,7 +163,7 @@ def hold_worker(
                 for step in itertools.count():
                     if stop_event.is_set():
                         break
-                    tactic = "skip" if step % 4 != 3 else "rfl"
+                    tactic = TACTICS_HOLD[step % len(TACTICS_HOLD)]
                     tac_result = branch.try_apply_tactic(tactic)
                     counters.inc("tactics")
                     if tactic_delay > 0 and stop_event.wait(tactic_delay):

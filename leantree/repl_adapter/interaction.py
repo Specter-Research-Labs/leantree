@@ -206,6 +206,20 @@ class LeanProcess:
         - a best-guess tag for common causes (SIGKILL → probably RLIMIT_AS
           or the OOM killer).
         """
+        stderr_tail = list(self._stderr_buffer)[-10:]
+
+        # Lean prints `INTERNAL PANIC: out of memory` on allocation failure
+        # and then exits; the exit code we race to observe is just noise in
+        # that case. Surface the real cause directly.
+        for line in stderr_tail:
+            low = line.lower()
+            if "out of memory" in low or "std::bad_alloc" in low:
+                return (
+                    "Lean REPL ran out of memory (INTERNAL PANIC) — tactic "
+                    "allocation exceeded available memory; reduce tactic "
+                    "size or raise --max-process-memory-gb"
+                )
+
         rc = getattr(self._proc, "returncode", None)
         if rc is None:
             exit_desc = "still running (race: stdout closed before wait() saw the exit)"
@@ -230,7 +244,6 @@ class LeanProcess:
             elif sig == signal.SIGSEGV:
                 hint = " — Lean segfault (likely tactic bug in the REPL)"
             exit_desc = f"killed by {sig_name}{hint}"
-        stderr_tail = list(self._stderr_buffer)[-10:]
         stderr_part = f" — last stderr: {stderr_tail!r}" if stderr_tail else ""
         return f"Lean REPL process ended unexpectedly ({exit_desc}){stderr_part}"
 
