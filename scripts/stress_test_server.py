@@ -61,7 +61,13 @@ def _report_exception(worker_id: int, where: str, exc: BaseException, counters: 
         )
 
 
-def nice_worker(worker_id: int, client: LeanClient, stop_event: threading.Event, counters: Counters):
+def nice_worker(
+    worker_id: int,
+    client: LeanClient,
+    stop_event: threading.Event,
+    counters: Counters,
+    tactic_delay: float,
+):
     counters.inc("workers_alive")
     try:
         while not stop_event.is_set():
@@ -87,6 +93,8 @@ def nice_worker(worker_id: int, client: LeanClient, stop_event: threading.Event,
                             break
                         tac_result = branch.try_apply_tactic(tactic)
                         counters.inc("tactics")
+                        if tactic_delay > 0 and stop_event.wait(tactic_delay):
+                            break
                         if not tac_result.is_success():
                             # tactic failure is fine; just move to next one
                             continue
@@ -103,7 +111,13 @@ def nice_worker(worker_id: int, client: LeanClient, stop_event: threading.Event,
         counters.inc("workers_alive", -1)
 
 
-def hold_worker(worker_id: int, client: LeanClient, stop_event: threading.Event, counters: Counters):
+def hold_worker(
+    worker_id: int,
+    client: LeanClient,
+    stop_event: threading.Event,
+    counters: Counters,
+    tactic_delay: float,
+):
     counters.inc("workers_alive")
     try:
         while not stop_event.is_set():
@@ -133,6 +147,8 @@ def hold_worker(worker_id: int, client: LeanClient, stop_event: threading.Event,
                     tactic = "skip" if step % 4 != 3 else "rfl"
                     tac_result = branch.try_apply_tactic(tactic)
                     counters.inc("tactics")
+                    if tactic_delay > 0 and stop_event.wait(tactic_delay):
+                        break
                     if tac_result.is_success() and tac_result.value:
                         new_branch = tac_result.value[0]
                         if new_branch.is_solved:
@@ -216,6 +232,12 @@ def main():
         default=1.0,
         help="Seconds between status lines (default: 1).",
     )
+    parser.add_argument(
+        "--tactic-delay",
+        type=float,
+        default=0.1,
+        help="Seconds to wait between tactic executions per worker (default: 0.1).",
+    )
     args = parser.parse_args()
 
     client = LeanClient(args.address, args.port)
@@ -239,7 +261,7 @@ def main():
     workers = [
         threading.Thread(
             target=worker_fn,
-            args=(i, client, stop_event, counters),
+            args=(i, client, stop_event, counters, args.tactic_delay),
             name=f"{args.action}-worker-{i}",
             daemon=True,
         )
