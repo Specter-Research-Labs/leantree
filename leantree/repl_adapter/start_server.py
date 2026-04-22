@@ -128,23 +128,6 @@ def main():
         action="store_true",
         help="Pre-start all processes to max capacity before accepting requests"
     )
-    parser.add_argument(
-        "--max-process-memory-gb",
-        type=float,
-        default=32.0,
-        help=(
-            "Per-Lean-subprocess RLIMIT_AS in GiB (default: 32). When a tactic's "
-            "address space exceeds this, the kernel SIGKILLs the subprocess "
-            "cleanly; the pool's existing poisoned-process logic swaps in a "
-            "fresh one. 0 disables the limit (not recommended in production). "
-            "8 GiB was experimentally too tight for Mathlib - Lean's "
-            "multi-threaded runtime allocates pthread stacks via mmap and the "
-            "address space fills quickly even before tactics execute, so the "
-            "leanserver fails to create its worker threads. 32 GiB is "
-            "comfortably above steady-state use (~2-4 GiB) and well below "
-            "the pathological cases we've seen (~100 GiB)."
-        )
-    )
 
     args = parser.parse_args()
 
@@ -194,16 +177,6 @@ def main():
             await process.send_command_async(imports_str)
         env_setup_async = setup_imports
 
-    # Compute RLIMIT_AS if requested
-    max_process_memory_bytes = (
-        int(args.max_process_memory_gb * 1024 ** 3) if args.max_process_memory_gb != 0 else None
-    )
-    if max_process_memory_bytes is not None:
-        print(
-            f"Per-process RLIMIT_AS: {args.max_process_memory_gb} GiB "
-            f"({max_process_memory_bytes} bytes) - runaway tactics will be SIGKILLed by the kernel"
-        )
-
     # Create process pool
     pool = LeanProcessPool(
         repl_exe=repl_exe,
@@ -211,7 +184,6 @@ def main():
         max_processes=args.max_processes,
         logger=Logger(LogLevel.DEBUG) if args.log_level == "DEBUG" else None,
         env_setup_async=env_setup_async,
-        max_process_memory_bytes=max_process_memory_bytes,
     )
 
     # Start server

@@ -2,6 +2,7 @@ import asyncio
 import ctypes
 import ctypes.util
 import json
+import os
 import re
 import resource
 import signal
@@ -14,6 +15,13 @@ from typing import Self, Any, AsyncIterator
 import psutil
 
 from leantree import utils
+from leantree.core.abstraction import ProofBranch
+from leantree.core.lean import LeanGoal, LeanTactic, LeanProofState
+from leantree.core.lean_file import LeanTheorem, LeanFile, StoredError
+from leantree.file_span import FilePosition, FileSpan
+from leantree.metavar_graph import MetavarGraph
+from leantree.repl_adapter.data import ReplGoalInfo, ReplCompilationUnit, FilePositionParser, ReplProofStepInfo
+from leantree.utils import is_just_comments, ValueOrError, get_source_with_sorries, to_sync, to_sync_iterator
 
 
 # Linux prctl numbers (from <sys/prctl.h>) — used to make lake/repl children
@@ -28,15 +36,11 @@ def _make_subprocess_preexec_fn(max_memory_bytes: int | None):
     Runs in the *child* between fork() and execve() so the limits apply to the
     Lean subprocess (and propagate via execve to its lake/lean grandchildren).
 
-    - ``RLIMIT_AS = max_memory_bytes`` (when set): a runaway tactic that
-      blows past this gets SIGKILLed cleanly by the kernel; the parent sees
-      EOF on the REPL pipes and surfaces a normal ``LeanProcessException``.
-      Without this, a single bad tactic can grow to 100+ GB and OOM-kill
-      the whole leanserver Python process (observed in production).
-    - ``prctl(PR_SET_PDEATHSIG, SIGKILL)``: when the parent process exits
-      for any reason (including SIGKILL by the OOM killer), the kernel
-      immediately sends SIGKILL to this child.  Eliminates the orphaned-
-      lake/repl-process problem we've been cleaning up by hand.
+    - ``RLIMIT_AS = max_memory_bytes`` (when set): a runaway tactic that blows past this gets SIGKILLed cleanly by the kernel; the parent sees EOF on the
+      REPL pipes and surfaces a normal ``LeanProcessException``.  Without this, a single bad tactic can grow to 100+ GB and OOM-kill the whole leanserver
+      Python process (observed in production).
+    - ``prctl(PR_SET_PDEATHSIG, SIGKILL)``: when the parent process exits for any reason (including SIGKILL by the OOM killer), the kernel
+      immediately sends SIGKILL to this child.  Eliminates orphaned lake/repl-processes.
     """
     libc_path = ctypes.util.find_library("c") or "libc.so.6"
     try:
@@ -44,35 +48,44 @@ def _make_subprocess_preexec_fn(max_memory_bytes: int | None):
     except OSError:
         _libc = None
 
+    # Runs post-fork, pre-exec: avoid Python's logging module (logger locks
+    # held in the parent at fork time can deadlock here).  Write directly to
+    # fd 2 instead - async-signal-safe and buffer-free.
+    def _warn(msg: str) -> None:
+        try:
+            os.write(2, f"[preexec] {msg}\n".encode("utf-8", "replace"))
+        except OSError:
+            pass
+
     def _preexec():
-        # Address-space ceiling.  Setting both soft and hard prevents the child
-        # itself from raising it later.  Wrap in try/except so a non-Linux
-        # platform (where RLIMIT_AS is unavailable / works differently) doesn't
-        # take down subprocess creation.
+        # Address-space ceiling. Set only the soft limit and preserve the
+        # inherited hard limit. Wrap in try/except so a non-Linux platform
+        # (where RLIMIT_AS is unavailable / works differently) doesn't take
+        # down subprocess creation.
         if max_memory_bytes is not None:
             try:
+                _, hard = resource.getrlimit(resource.RLIMIT_AS)
                 resource.setrlimit(
-                    resource.RLIMIT_AS, (max_memory_bytes, max_memory_bytes)
+                    resource.RLIMIT_AS, (max_memory_bytes, hard)
                 )
-            except (ValueError, OSError):
-                pass
+            except (ValueError, OSError) as e:
+                _warn(f"setrlimit(RLIMIT_AS, {max_memory_bytes}) failed: {e!r}")
         # Parent-death signal: SIGKILL when leanserver Python process exits.
         # Linux-only; harmless no-op elsewhere because libc.prctl will just
         # error out and we swallow it.
         if _libc is not None:
             try:
-                _libc.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
-            except (AttributeError, OSError):
-                pass
+                rc = _libc.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+                if rc != 0:
+                    errno = ctypes.get_errno()
+                    _warn(
+                        f"prctl(PR_SET_PDEATHSIG, SIGKILL) returned {rc} "
+                        f"(errno={errno})"
+                    )
+            except (AttributeError, OSError) as e:
+                _warn(f"prctl(PR_SET_PDEATHSIG, SIGKILL) failed: {e!r}")
 
     return _preexec
-from leantree.core.abstraction import ProofBranch
-from leantree.core.lean import LeanGoal, LeanTactic, LeanProofState
-from leantree.core.lean_file import LeanTheorem, LeanFile, StoredError
-from leantree.file_span import FilePosition, FileSpan
-from leantree.metavar_graph import MetavarGraph
-from leantree.repl_adapter.data import ReplGoalInfo, ReplCompilationUnit, FilePositionParser, ReplProofStepInfo
-from leantree.utils import is_just_comments, ValueOrError, get_source_with_sorries, to_sync, to_sync_iterator
 
 
 # TODO!: maybe not all sorries are reported: see https://github.com/leanprover-community/repl/issues/4
@@ -157,17 +170,15 @@ class LeanProcess:
         project_path: Path,
         logger: utils.Logger = None,
         pool: Any = None,
-        max_memory_bytes: int | None = None,
+        rss_hard_limit: int | None = None,
     ):
         self.repl_exe = repl_exe
         self.project_path = project_path
         self.logger = logger if logger else utils.NullLogger()
         self.pool = pool
         # Hard per-subprocess address-space ceiling enforced via RLIMIT_AS in
-        # ``start_async``'s preexec_fn.  ``None`` disables the limit (the
-        # Lean subprocess inherits the parent's, which is usually unlimited
-        # — and that's how a runaway tactic took down a 247 GB host).
-        self.max_memory_bytes = max_memory_bytes
+        # ``start_async``'s preexec_fn.  ``None`` disables the limit.
+        self.rss_hard_limit = rss_hard_limit
 
         self._proc = None
         self._env_id = None
@@ -248,7 +259,7 @@ class LeanProcess:
         # fork() and execve(), so the Lean subprocess (and everything it
         # exec's into via lake) inherits a hard memory ceiling and dies with
         # the parent.  See _make_subprocess_preexec_fn.
-        preexec_fn = _make_subprocess_preexec_fn(self.max_memory_bytes)
+        preexec_fn = _make_subprocess_preexec_fn(self.rss_hard_limit)
         self._proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(self.project_path),
@@ -281,7 +292,7 @@ class LeanProcess:
         # every other handler thread because they all cross into the same
         # loop via `_run_async`.  After SIGKILL the kernel should reap
         # within milliseconds; 5 s is a generous ceiling.  If we hit it we
-        # log and move on — leaking one already-dead subprocess in zombie
+        # log and move on - leaking one already-dead subprocess in zombie
         # state is much cheaper than freezing the server.
         try:
             await asyncio.wait_for(self._proc.wait(), timeout=5.0)
@@ -728,48 +739,28 @@ class LeanProcess:
 
     take_control = to_sync(take_control_async)
 
-    def memory_usage(self) -> int:
+    def _memory_usage(self, get_memory) -> int:
+        self._assert_started()
+        try:
+            process = psutil.Process(self._proc.pid)
+            total = get_memory(process)
+            for child in process.children(recursive=True):
+                total += get_memory(child)
+            return total
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error) as e:
+            raise LeanProcessException(f"Failed to get memory usage", e)
+
+    def memory_usage_pss(self) -> int:
         """
         Returns the PSS (Proportional Set Size) memory usage of the Lean REPL process
         and all its children in bytes. PSS divides shared pages by the number of
         processes sharing them, avoiding the overcounting that RSS suffers from when
         many processes share memory-mapped files (e.g. Mathlib .olean files).
-
-        Falls back to RSS on platforms where PSS is unavailable (non-Linux).
         """
-        self._assert_started()
-        try:
-            process = psutil.Process(self._proc.pid)
-            total = self._process_pss_or_rss(process)
-            for child in process.children(recursive=True):
-                try:
-                    total += self._process_pss_or_rss(child)
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-            return total
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error) as e:
-            raise LeanProcessException(f"Failed to get memory usage", e)
+        return self._memory_usage(lambda proc: proc.memory_full_info().pss)
 
-    @staticmethod
-    def _process_pss_or_rss(process: psutil.Process) -> int:
-        """Return PSS if available (Linux), otherwise fall back to RSS."""
-        try:
-            return process.memory_full_info().pss
-        except (AttributeError, psutil.AccessDenied):
-            return process.memory_info().rss
-
-    def virtual_memory_usage(self) -> int:
-        """
-        Deprecated: Use memory_usage() instead.
-        Returns the virtual memory size (VMS) of the Lean REPL process in bytes.
-        """
-        self._assert_started()
-        try:
-            process = psutil.Process(self._proc.pid)
-            mem_info = process.memory_info()
-            return mem_info.vms
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error) as e:
-            raise LeanProcessException(f"Failed to get memory usage", e)
+    def memory_usage_rss(self) -> int:
+        return self._memory_usage(lambda proc: proc.memory_info().rss)
 
     async def send_theorem_async(self, theorem_str: str) -> ReplCompilationUnit:
         """Send a theorem to the REPL asynchronously."""
