@@ -31,29 +31,20 @@ def test_shuffle_hypotheses():
             
     assert shuffled_at_least_once
 
-def test_shuffle_goals():
-    # Setup
+def test_goals_list_order_preserved():
+    # The goals list must not be shuffled: tactics act on the focused (first) goal, so
+    # reordering would change the semantics of the recorded (state, tactic) pair.
     g1 = LeanGoal(type="True", hypotheses=[], tag="g1")
     g2 = LeanGoal(type="False", hypotheses=[], tag="g2")
     g3 = LeanGoal(type="1=1", hypotheses=[], tag="g3")
     state = LeanProofState(goals=[g1, g2, g3])
     node = ProofTreeNode(id="1", state=state)
-    
-    # Execute
-    shuffled_at_least_once = False
+
     for i in range(100):
         shuffler = ShuffleGoalsAndHypotheses(shuffle_prob=1.0, seed=i)
         new_node = shuffler.run(node)
-        
-        # Invariants
-        assert len(new_node.state.goals) == 3
         tags = [g.tag for g in new_node.state.goals]
-        assert set(tags) == {"g1", "g2", "g3"}
-        
-        if tags != ["g1", "g2", "g3"]:
-            shuffled_at_least_once = True
-            
-    assert shuffled_at_least_once
+        assert tags == ["g1", "g2", "g3"]
 
 def test_shuffle_no_op():
     g1 = LeanGoal(type="True", hypotheses=[], tag="g1")
@@ -72,7 +63,11 @@ def test_rename_variables_basic():
     h2 = LeanHypothesis(type="MyVar > 0", user_name="h_ineq", value=None)
     goal = LeanGoal(type="MyVar = MyVar", hypotheses=[h1, h2], tag="tag")
     state = LeanProofState(goals=[goal])
-    node = ProofTreeNode(id="1", state=state)
+    tactic = LeanTactic("rfl")
+    child = ProofTreeNode(id="2", state=LeanProofState([]))
+    edge = ProofTreeEdge(tactic=tactic, span=None, parent=None, children=[child])
+    node = ProofTreeNode(id="1", state=state, tactic=edge)
+    edge.parent = node
 
     renamed_at_least_once = False
     
@@ -138,7 +133,11 @@ def test_rename_goals_basic():
     # Setup
     g1 = LeanGoal(type="True", hypotheses=[], tag="case_one")
     state = LeanProofState(goals=[g1])
-    node = ProofTreeNode(id="1", state=state)
+    tactic = LeanTactic("trivial")
+    child = ProofTreeNode(id="2", state=LeanProofState([]))
+    edge = ProofTreeEdge(tactic=tactic, span=None, parent=None, children=[child])
+    node = ProofTreeNode(id="1", state=state, tactic=edge)
+    edge.parent = node
     
     renamed_at_least_once = False
     dropped_at_least_once = False
@@ -207,3 +206,37 @@ def test_replace_name_boundaries():
     text3 = "n' + n"
     new_text3 = _replace_name(text3, "n", "x")
     assert new_text3 == "n' + x"
+
+    # Dotted/qualified names should not be matched by the suffix.
+    text4 = "Foo.bar + bar"
+    new_text4 = _replace_name(text4, "bar", "baz")
+    assert new_text4 == "Foo.bar + baz"
+
+    text5 = "Foo.bar.baz"
+    new_text5 = _replace_name(text5, "bar", "qux")
+    assert new_text5 == "Foo.bar.baz"
+
+
+def test_rename_variables_no_dagger_collision():
+    # If `h✝` already exists, renaming another hypothesis must never produce `h✝` again.
+    # With ✝-suffix transform: a candidate `hX` (any X) → `h` + `✝` collides. So `h` and
+    # `h✝` must both be banned from the candidate pool, and the post-transform form is
+    # re-checked before being accepted.
+    h_dagger = LeanHypothesis(type="Nat", user_name="h✝", value=None)
+    h_other = LeanHypothesis(type="Nat", user_name="x✝", value=None)
+    goal = LeanGoal(type="True", hypotheses=[h_dagger, h_other], tag=None)
+    state = LeanProofState(goals=[goal])
+    tactic = LeanTactic("trivial")
+    child = ProofTreeNode(id="2", state=LeanProofState([]))
+    edge = ProofTreeEdge(tactic=tactic, span=None, parent=None, children=[child])
+    node = ProofTreeNode(id="1", state=state, tactic=edge)
+    edge.parent = node
+
+    for i in range(500):
+        renamer = RandomRename(rename_prob=1.0, seed=i)
+        new_goal = renamer.run(node).state.goals[0]
+        names = [h.user_name for h in new_goal.hypotheses]
+        # Every ✝-suffixed name must still end in ✝, and no duplicates.
+        for name in names:
+            assert name.endswith("✝"), f"expected ✝ suffix, got {name!r}"
+        assert len(set(names)) == len(names), f"duplicate hypothesis names: {names}"
