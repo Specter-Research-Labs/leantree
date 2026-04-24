@@ -1,5 +1,6 @@
 from typing import Self
 import logging
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -205,7 +206,12 @@ class LeanProject:
 
         # Note: We could use `math` instead of `lib` to get mathlib dependency automatically. However, this overwrites
         # lean-toolchain with that of the latest mathlib. So instead, we add mathlib manually.
-        run_command(["lake", "init", ".", "lib.toml"])
+        # Derive a valid Lean identifier from the directory name: `lake init .` would otherwise use the raw name,
+        # and Lake panics in `modToFilePath` if it contains a `.` or starts with a digit (e.g. `proj_v4.27`).
+        pkg_name = re.sub(r"[^A-Za-z0-9_]", "_", path.name)
+        if not pkg_name or pkg_name[0].isdigit():
+            pkg_name = "_" + pkg_name
+        run_command(["lake", "init", pkg_name, "lib.toml"])
 
         libraries = libraries or []
         libraries = [LeanLibraries.from_name(library) if isinstance(library, str) else library for library in libraries]
