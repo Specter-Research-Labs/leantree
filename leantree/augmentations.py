@@ -163,6 +163,25 @@ def random_rename_variables(goals: list[LeanGoal], tactic: str, rng=random) -> t
         
     return new_goals, tactic
 
+def _tag_rename_is_ambiguous(old_name: str, this_goal: LeanGoal, goals: list[LeanGoal], tactic: str) -> bool:
+    # A standalone identifier match of `old_name` outside of `this_goal.tag` itself means we
+    # cannot tell whether the occurrence is the tag or an unrelated identifier that happens to
+    # spell the same (e.g. a fresh name introduced by the tactic, a bound variable in a type).
+    # Skip the rename rather than risk corrupting (state, tactic) semantics.
+    sentinel = "\x00"
+
+    def appears(text: str) -> bool:
+        return _replace_name(text, old_name, sentinel) != text
+
+    if appears(tactic) or appears(this_goal.type):
+        return True
+    for g in goals:
+        for h in g.hypotheses:
+            if h.user_name == old_name or appears(h.type) or (h.value and appears(h.value)):
+                return True
+    return False
+
+
 def random_rename_goals(goals: list[LeanGoal], tactic: str, rng=random) -> tuple[list[LeanGoal], str]:
     avoid_names = set()
     for g in goals:
@@ -172,52 +191,30 @@ def random_rename_goals(goals: list[LeanGoal], tactic: str, rng=random) -> tuple
             avoid_names.add(h.user_name)
 
     new_goals = []
-    replacements = {}
-    
     for g in goals:
         old_name = g.tag
-        length = min(len(old_name), 6) if old_name else rng.randint(1, 5)
-        new_name = _generate_random_name(length, avoid_names, rng=rng)
-        avoid_names.add(new_name)
-        
         updated_goal = g
-        renamed = False
-        
+
         if old_name is None:
             if rng.random() < 0.5:
+                new_name = _generate_random_name(rng.randint(1, 5), avoid_names, rng=rng)
+                avoid_names.add(new_name)
                 updated_goal = g.with_(tag=new_name)
-        else:
-            new_type = _replace_name(g.type, old_name, new_name)
-            used_in_type = (new_type != g.type)
-            
-            used_in_tactic = False
-            # Check if replacing would change the tactic string
-            if _replace_name(tactic, old_name, new_name) != tactic:
-                used_in_tactic = True
-            
-            if used_in_type or used_in_tactic:
-                if rng.random() < 0.5:
-                    updated_goal = g.with_(tag=new_name, type=new_type)
-                    renamed = True
+        elif not _tag_rename_is_ambiguous(old_name, g, goals, tactic):
+            # Unambiguous: `old_name` appears only as `g.tag`, so renaming or dropping the tag
+            # cannot desynchronize any other text. The tactic is left unchanged.
+            rand_val = rng.random()
+            if rand_val < 1/3:
+                new_name = _generate_random_name(min(len(old_name), 6), avoid_names, rng=rng)
+                avoid_names.add(new_name)
+                updated_goal = g.with_(tag=new_name)
+            elif rand_val < 2/3:
+                pass
             else:
-                rand_val = rng.random()
-                if rand_val < 1/3:
-                    updated_goal = g.with_(tag=new_name)
-                    renamed = True
-                elif rand_val < 2/3:
-                    pass
-                else:
-                    updated_goal = g.with_(tag=None)
-        
-        if renamed:
-            replacements[old_name] = new_name
-            
+                updated_goal = g.with_(tag=None)
+
         new_goals.append(updated_goal)
-        
-    if replacements and tactic:
-        for old_name, new_name in replacements.items():
-            tactic = _replace_name(tactic, old_name, new_name)
-            
+
     return new_goals, tactic
 
 
