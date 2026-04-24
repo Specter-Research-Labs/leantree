@@ -1,7 +1,7 @@
 """Benchmark leanserver warmup time across fresh subprocess starts.
 
 Each iteration: launch a fresh `leanserver --warmup ...` subprocess, measure
-the wall-clock time until it prints "Warmup complete.", then kill it.
+the wall-clock time until it logs that it is accepting requests, then kill it.
 """
 
 import argparse
@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 
-WARMUP_MARKER = "Warmup complete."
+WARMUP_MARKER = "Server accepting requests"
 
 
 def run_one_iter(
