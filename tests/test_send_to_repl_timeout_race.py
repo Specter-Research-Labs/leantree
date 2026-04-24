@@ -1,6 +1,6 @@
 """Regression test for CPython issue 30289 in `_send_to_repl_async`.
 
-Background — when the original implementation used ``asyncio.wait_for`` to
+Background - when the original implementation used ``asyncio.wait_for`` to
 bound a ``readline()`` call, a timeout would cancel the inner coroutine
 mid-await but leave ``StreamReader._waiter`` set.  The next read on the
 same stream then raised ``RuntimeError: readuntil() called while another
@@ -9,7 +9,7 @@ RuntimeError propagated into the leanserver's asyncio event loop and
 deadlocked the whole HTTP server.
 
 This test forces a deadline-induced read abort and asserts that the
-follow-up call fails with ``LeanProcessException`` (poisoned process —
+follow-up call fails with ``LeanProcessException`` (poisoned process -
 expected after we kill it) rather than the RuntimeError race.
 
 Run with::
@@ -62,7 +62,7 @@ async def _force_timeout_then_retry():
 
     With the fix in place, the timeout SIGKILLs the subprocess, the
     inner read returns ``b""`` (EOF), and both calls surface as
-    ``LeanProcessException`` — no RuntimeError, no stream corruption.
+    ``LeanProcessException`` - no RuntimeError, no stream corruption.
     """
     proc = LeanProcess(REPL_EXE, PROJECT_PATH)
     await proc.start_async()
@@ -76,7 +76,7 @@ async def _force_timeout_then_retry():
             f"first call should have surfaced as a timeout, got: {first_exc_info.value!r}"
         )
 
-        # The bug — if present — would manifest here as a RuntimeError
+        # The bug - if present - would manifest here as a RuntimeError
         # bubbling up from `StreamReader._waiter`.  Any LeanProcessException
         # is acceptable (the process is dead, so EOF / pipe-closed are both
         # fine), as long as it is NOT a RuntimeError.
@@ -105,13 +105,13 @@ async def _concurrent_reads_must_not_race():
 
     With the fix, the first timeout SIGKILLs the subprocess.  The second
     coroutine sees EOF / pipe-closed and surfaces as
-    ``LeanProcessException`` — never as ``RuntimeError``.
+    ``LeanProcessException`` - never as ``RuntimeError``.
     """
     proc = LeanProcess(REPL_EXE, PROJECT_PATH)
     await proc.start_async()
     try:
         # Coroutine A: tight timeout that will fire while readline is
-        # parked.  Coroutine B: launched 50 ms later — under the buggy
+        # parked.  Coroutine B: launched 50 ms later - under the buggy
         # code its readline await lands while A's _waiter is still set.
         async def call(cmd, timeout, delay):
             await asyncio.sleep(delay)
@@ -130,7 +130,7 @@ async def _concurrent_reads_must_not_race():
         )
         for tag, msg in results:
             assert tag != "race", (
-                f"StreamReader race regression — got RuntimeError: {msg}"
+                f"StreamReader race regression - got RuntimeError: {msg}"
             )
     finally:
         await proc.stop_async_safe()

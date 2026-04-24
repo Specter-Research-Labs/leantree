@@ -12,7 +12,7 @@ alive under pathological tactics:
   immediately when its parent (the leanserver Python process) exits.
   Eliminates the orphaned-grandchild problem we kept cleaning up by hand.
 
-We don't need a real Lean REPL to verify either property — the preexec_fn
+We don't need a real Lean REPL to verify either property - the preexec_fn
 runs in any subprocess.create_subprocess_exec call.  These tests use
 ``sleep`` and a tiny Python one-liner so they finish in <2 s.
 
@@ -83,7 +83,7 @@ def test_rlimit_as_kills_oversize_allocation():
     # Limit must be high enough for Python + libc to start at all.  256 MiB
     # is plenty for `import sys` but far below the 1 GiB allocation below.
     limit = 256 * 1024 * 1024
-    # bytearray of 1 GiB will request ~1 GiB of address space — easily
+    # bytearray of 1 GiB will request ~1 GiB of address space - easily
     # past the 256 MiB ceiling.
     code = "x = bytearray(1024*1024*1024); print(len(x))"
     proc = _run_with_preexec(
@@ -92,10 +92,10 @@ def test_rlimit_as_kills_oversize_allocation():
     )
     proc.wait(timeout=10)
     # Either MemoryError (Python catches the failed alloc) returns nonzero,
-    # or the kernel kills the process with SIGKILL.  Both are acceptable —
+    # or the kernel kills the process with SIGKILL.  Both are acceptable -
     # what we care about is that the giant allocation did NOT succeed.
     assert proc.returncode != 0, (
-        f"subprocess returned 0 despite {limit}-byte RLIMIT_AS — alloc was not blocked"
+        f"subprocess returned 0 despite {limit}-byte RLIMIT_AS - alloc was not blocked"
     )
 
 
@@ -112,7 +112,7 @@ def test_no_rlimit_as_when_disabled():
             time.sleep(0.05)
         lines = [l for l in text.splitlines() if l.startswith("Max address space")]
         soft, hard = lines[0].split()[3], lines[0].split()[4]
-        # When unset we expect "unlimited" — the proc text uses that literal
+        # When unset we expect "unlimited" - the proc text uses that literal
         # (it's what the kernel reports when RLIM_INFINITY is in effect).
         assert soft == "unlimited", f"soft={soft!r} (expected unlimited)"
         assert hard == "unlimited", f"hard={hard!r} (expected unlimited)"
@@ -125,7 +125,7 @@ def test_no_rlimit_as_when_disabled():
 
 def test_pdeathsig_kills_child_when_parent_dies():
     """A grandchild spawned via _make_subprocess_preexec_fn should die
-    immediately when its (intermediate) parent exits — even if we never
+    immediately when its (intermediate) parent exits - even if we never
     explicitly kill it.  Historically these grandchildren were orphaned
     when the leanserver crashed, accumulating until manual cleanup."""
     # Pattern: this test process spawns a Python child; the child spawns a
@@ -169,7 +169,7 @@ time.sleep(60)
             os.kill(grandchild_pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        pytest.fail(f"grandchild pid={grandchild_pid} survived parent death — PDEATHSIG didn't fire")
+        pytest.fail(f"grandchild pid={grandchild_pid} survived parent death - PDEATHSIG didn't fire")
     finally:
         if child.poll() is None:
             child.kill()

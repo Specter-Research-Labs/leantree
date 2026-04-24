@@ -329,7 +329,7 @@ class ModelProvider:
         if len(prompts) > batch_size * self.n_gpus:
             raise ValueError(
                 f"Number of prompts ({len(prompts)}) can be at most "
-                f"per_device_batch_size ({batch_size}) × #GPUs ({self.n_gpus})."
+                f"per_device_batch_size ({batch_size}) * #GPUs ({self.n_gpus})."
             )
 
         # determine how many GPUs (i.e. batches) we need

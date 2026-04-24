@@ -144,7 +144,7 @@ class ProofTreeBuilder:
                 sub_branches = branch.apply_tactic(tactic)
             except LeanInteractionException as e:
                 if "No goals" in str(e):
-                    # The goal was already closed by a prior tactic — this step is
+                    # The goal was already closed by a prior tactic - this step is
                     # redundant.  Treat as success with no remaining goals.
                     sub_branches = []
                 else:

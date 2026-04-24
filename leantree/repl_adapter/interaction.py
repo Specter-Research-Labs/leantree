@@ -25,7 +25,7 @@ from leantree.repl_adapter.data import ReplGoalInfo, ReplCompilationUnit, FilePo
 from leantree.utils import is_just_comments, ValueOrError, get_source_with_sorries, to_sync, to_sync_iterator
 
 
-# Linux prctl numbers (from <sys/prctl.h>) — used to make lake/repl children
+# Linux prctl numbers (from <sys/prctl.h>) - used to make lake/repl children
 # die immediately when their parent (the leanserver Python process) dies,
 # eliminating orphan processes after a crash or `kill -9`.
 _PR_SET_PDEATHSIG = 1
@@ -196,14 +196,14 @@ class LeanProcess:
     def _describe_ended_process(self) -> str:
         """Human-readable explanation of why the REPL subprocess ended.
 
-        Used when we observe EOF on stdout — the precise cause is the single
+        Used when we observe EOF on stdout - the precise cause is the single
         most useful piece of information for debugging a run (e.g. "is our
         RLIMIT_AS too strict?" is only answerable if the server log shows
         SIGKILL specifically).  Combines:
         - the subprocess exit code / signal (sign-negated is the signal),
         - the last few lines the subprocess wrote to stderr (already
           captured by `_monitor_stderr`),
-        - a best-guess tag for common causes (SIGKILL → probably RLIMIT_AS
+        - a best-guess tag for common causes (SIGKILL -> probably RLIMIT_AS
           or the OOM killer).
         """
         stderr_tail = list(self._stderr_buffer)[-10:]
@@ -215,7 +215,7 @@ class LeanProcess:
             low = line.lower()
             if "out of memory" in low or "std::bad_alloc" in low:
                 return (
-                    "Lean REPL ran out of memory (INTERNAL PANIC) — tactic "
+                    "Lean REPL ran out of memory (INTERNAL PANIC) - tactic "
                     "allocation exceeded available memory; reduce tactic "
                     "size or raise --max-process-memory-gb"
                 )
@@ -244,13 +244,13 @@ class LeanProcess:
                 # 2. The kernel enforcing RLIMIT_AS (our 8 GiB ceiling).
                 # 3. The kernel OOM killer (host is out of memory).
                 hint = (
-                    " — likely RLIMIT_AS ceiling hit or kernel OOM killer; "
+                    " - likely RLIMIT_AS ceiling hit or kernel OOM killer; "
                     "if this recurs, consider raising --max-process-memory-gb"
                 )
             elif sig == signal.SIGSEGV:
-                hint = " — Lean segfault (likely tactic bug in the REPL)"
+                hint = " - Lean segfault (likely tactic bug in the REPL)"
             exit_desc = f"killed by {sig_name}{hint}"
-        stderr_part = f" — last stderr: {stderr_tail!r}" if stderr_tail else ""
+        stderr_part = f" - last stderr: {stderr_tail!r}" if stderr_tail else ""
         return f"Lean REPL process ended unexpectedly ({exit_desc}){stderr_part}"
 
     async def _monitor_stderr(self):
@@ -318,7 +318,7 @@ class LeanProcess:
             await asyncio.wait_for(self._proc.wait(), timeout=5.0)
         except asyncio.TimeoutError:
             self.logger.warning(
-                f"Lean subprocess pid={self._proc.pid} did not reap within 5s after SIGKILL — "
+                f"Lean subprocess pid={self._proc.pid} did not reap within 5s after SIGKILL - "
                 "leaving as a zombie to keep the event loop responsive"
             )
 
@@ -389,7 +389,7 @@ class LeanProcess:
             timeout: Maximum seconds to wait for a complete response.
                      ``None`` means no limit.
 
-        Implementation note — timeout is enforced by SIGKILL-on-deadline,
+        Implementation note - timeout is enforced by SIGKILL-on-deadline,
         not ``asyncio.wait_for``.  Cancelling a task that's parked inside
         ``StreamReader.readline()`` does NOT reliably reset the reader's
         internal ``_waiter`` (CPython issue 30289).  In practice this means
@@ -430,7 +430,7 @@ class LeanProcess:
             while True:
                 line = await self._proc.stdout.readline()
                 if not line:
-                    # The subprocess's stdout closed — it has exited (or is
+                    # The subprocess's stdout closed - it has exited (or is
                     # about to).  Build a richer diagnostic so we can tell
                     # *why* from the server log alone.  Cases we care about:
                     #   - returncode == -9 (SIGKILL): RLIMIT_AS ceiling hit,
@@ -542,7 +542,7 @@ class LeanProcess:
             timeout: seconds to wait for the REPL response.  Default 300s
                 matches ``_send_to_repl_async``'s default.  Callers that send
                 expensive long-running commands (e.g. ``import Mathlib`` at
-                warmup under heavy system load — observed to take >5 min on
+                warmup under heavy system load - observed to take >5 min on
                 loaded hosts) should pass a larger value.
         """
         self._assert_started()

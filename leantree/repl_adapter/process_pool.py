@@ -38,7 +38,7 @@ class LeanProcessPool:
                Hard per-Lean-subprocess address-space
                ceiling enforced by ``RLIMIT_AS`` set in a ``preexec_fn``.
                A pathological tactic that exceeds this gets SIGKILLed by the
-               kernel and surfaces as a clean ``LeanProcessException`` —
+               kernel and surfaces as a clean ``LeanProcessException`` -
                which the leanserver's poisoned-process path then handles by
                replacing the dead process.  ``None`` disables the limit.
             pss_recycle_limit:
@@ -87,7 +87,7 @@ class LeanProcessPool:
 
         If ``env_setup_async`` raises after ``start_async`` succeeded, the
         half-created subprocess would be orphaned (asyncio's Process, plus its
-        ~48 MiB of StreamReader buffers, plus the live lake/repl child) —
+        ~48 MiB of StreamReader buffers, plus the live lake/repl child) -
         nothing else references it, so Python GC eventually runs, but
         ``_stderr_task`` is registered on the event loop and keeps the whole
         thing alive until that task exits.  Be explicit: on any exception after

@@ -5,12 +5,12 @@ Before the fix, every ``_run_async(coro)`` call in server.py passed
 ``timeout=None`` and so the HTTP handler thread would block on
 ``future.result()`` indefinitely if any coroutine on the loop didn't
 complete.  That was the architectural root cause of the "leanserver
-looks alive but /status hangs" failure mode — one stuck coro froze every
+looks alive but /status hangs" failure mode - one stuck coro froze every
 handler behind it.
 
 These tests exercise the fix by blocking the event loop *on purpose*
 (via ``loop.call_soon_threadsafe`` + ``time.sleep`` on the loop thread,
-which really parks the loop — not just an async sleep that yields) and
+which really parks the loop - not just an async sleep that yields) and
 asserting that handler threads still return promptly with HTTP 503.
 """
 
@@ -64,7 +64,7 @@ class _FakePool:
         return self._process_available_event
 
     async def get_process_async(self, blocking: bool = True, timeout: float | None = None):
-        # Never returns a process — simulates a fully-occupied pool so the
+        # Never returns a process - simulates a fully-occupied pool so the
         # get_process_async coro has to wait (and we can time it out).
         if blocking:
             await asyncio.sleep(timeout if timeout is not None else 999)
@@ -111,7 +111,7 @@ def _block_loop(server: LeanServer, seconds: float) -> threading.Event:
     """Make the event loop unresponsive for ``seconds`` seconds.
 
     We schedule a callback that calls ``time.sleep`` directly on the loop
-    thread — not ``asyncio.sleep``, which would yield.  Returns an event
+    thread - not ``asyncio.sleep``, which would yield.  Returns an event
     set once the block has actually started so the caller can synchronize.
     """
     started = threading.Event()
@@ -134,7 +134,7 @@ def test_handler_returns_503_when_loop_is_blocked(running_server):
     # timeout + RUN_ASYNC_HEADROOM (=30 s) as its _run_async deadline, and
     # the inner coro's own timeout is what the caller passes as
     # ``timeout`` in the request body.  We pass timeout=1.0 so the total
-    # server-side deadline is ~31 s — well under the 60 s loop block.
+    # server-side deadline is ~31 s - well under the 60 s loop block.
     _block_loop(server, seconds=60.0)
 
     # Allow a socket timeout generous enough to catch a real 503 but short
@@ -146,7 +146,7 @@ def test_handler_returns_503_when_loop_is_blocked(running_server):
     # Client-visible latency should match the server-side deadline
     # (1.0 + RUN_ASYNC_HEADROOM=30.0), not the full 60 s loop block.
     assert elapsed < 1.0 + RUN_ASYNC_HEADROOM + 5.0, (
-        f"handler took {elapsed:.1f}s — server didn't honor the _run_async deadline"
+        f"handler took {elapsed:.1f}s - server didn't honor the _run_async deadline"
     )
 
 
@@ -174,6 +174,6 @@ if __name__ == "__main__":
     try:
         test_handler_returns_503_when_loop_is_blocked((server, port))
         test_status_still_responds_while_loop_slow((server, port))
-        print("OK: stuck loop → HTTP 503, /status stays up")
+        print("OK: stuck loop -> HTTP 503, /status stays up")
     finally:
         server.stop()

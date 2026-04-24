@@ -1,12 +1,12 @@
 """Verify `_destroy_process` evicts the LeanProcess from `pool.checkpoints`.
 
 Without this eviction, every poisoned Lean process keeps its full
-``LeanProcess`` Python object alive in the dict forever — including the
+``LeanProcess`` Python object alive in the dict forever - including the
 underlying ``asyncio.subprocess.Process``'s ~16 MiB-per-stream buffers.
 
 Production root cause of the 110/137/204 GiB leanserver leak: ~30
 poisoned processes/min (from RLIMIT_AS hits, Lean stack overflows,
-etc.) × hours = thousands of retained LeanProcess objects, each
+etc.) * hours = thousands of retained LeanProcess objects, each
 holding tens of MiB. The fix (commit following this test) pops
 ``pool.checkpoints[process]`` inside the ``_release_slot`` coroutine
 that ``_destroy_process`` already schedules.
@@ -79,7 +79,7 @@ def test_destroy_process_evicts_checkpoint(running_server):
     # The pool simulates having created a process and recorded its checkpoint.
     server.pool.checkpoints[process] = "sentinel-checkpoint"
     # Register it with the server as checked-out (how a real request flow
-    # would have it — process_id_to_process + process_to_id populated).
+    # would have it - process_id_to_process + process_to_id populated).
     process_id = server._get_process_id(process)
 
     assert process in server.pool.checkpoints
@@ -88,7 +88,7 @@ def test_destroy_process_evicts_checkpoint(running_server):
     server._destroy_process(process_id, reason="test")
 
     assert process not in server.pool.checkpoints, (
-        "LeanProcess remained in pool.checkpoints after _destroy_process — "
+        "LeanProcess remained in pool.checkpoints after _destroy_process - "
         "production leak regression (see commit message)"
     )
     assert len(server.pool.checkpoints) == 0

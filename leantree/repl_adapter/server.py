@@ -27,7 +27,7 @@ from leantree.utils import serialize_exception, deserialize_exception, ValueOrEr
 # These wrap the *inner* async operation's own timeout with a small headroom,
 # so the server-side `_run_async` never waits longer than the coroutine itself
 # promised to take.
-RUN_ASYNC_HEADROOM = 30.0  # seconds — wraps caller-supplied operation timeouts
+RUN_ASYNC_HEADROOM = 30.0  # seconds - wraps caller-supplied operation timeouts
 STOP_ASYNC_TIMEOUT = 10.0  # bounded wait in stop_async is already 5s (D1); +5s headroom
 RELEASE_SLOT_TIMEOUT = 5.0  # trivial bookkeeping coro
 RETURN_PROCESS_TIMEOUT = 30.0  # drain_repl_output is near-instant; 30s is generous
@@ -56,7 +56,7 @@ class _ProcessRegistry:
     sprinkled around ``LeanServer`` and hand-juggled in at least seven call
     sites (``_destroy_process``, ``_handle_return_process``, ``stop``,
     ``_reap_leaked_processes``, ...).  Every atomic update has to touch all
-    three dicts consistently — forgetting to pop one was how we leaked
+    three dicts consistently - forgetting to pop one was how we leaked
     ``LeanProcess`` objects into ``pool.checkpoints`` (fixed in
     commit 013014b).  Encapsulating the invariant here means each call site
     reads as one operation instead of four, and new call sites can't
@@ -221,14 +221,14 @@ class LeanServer:
             reason: human-readable explanation (usually ``str(exception)``).
                 Surfaced in the warning log so we can tell at a glance
                 whether processes are dying from RLIMIT_AS, timeouts,
-                Lean segfaults, etc. — without this, every destruction
+                Lean segfaults, etc. - without this, every destruction
                 looked identical in the log.
 
         Note (A2): the slow `_run_async` calls below MUST happen *outside*
         the process-registry lock.  Holding a server-wide lock while waiting
         on the asyncio loop would freeze every other handler that needs it
         (status, get_process_id, return_process, ...) if the loop ever
-        slowed down — exactly the cascading-deadlock failure mode we're
+        slowed down - exactly the cascading-deadlock failure mode we're
         fixing.  ``_ProcessRegistry.remove`` scopes its lock to the atomic
         dict pop and releases before we return.
         """
@@ -244,16 +244,16 @@ class LeanServer:
         except concurrent.futures.TimeoutError:
             self.logger.error(
                 f"stop_async_safe for poisoned process {process_id} did not complete in "
-                f"{STOP_ASYNC_TIMEOUT}s — leaking the subprocess to avoid blocking the loop"
+                f"{STOP_ASYNC_TIMEOUT}s - leaking the subprocess to avoid blocking the loop"
             )
         except Exception as e:
             self.logger.warning(f"Error stopping poisoned process {process_id}: {e}")
         # Decrement pool's used count so a replacement can be created.
-        # Critically, also evict the LeanProcess from self.pool.checkpoints —
+        # Critically, also evict the LeanProcess from self.pool.checkpoints -
         # otherwise every poisoned process leaks the full LeanProcess object
         # (including its ~16 MiB-per-stream asyncio buffers for stdin /
         # stdout / stderr) forever.  Observed in production: ~30 poisoned
-        # processes/min × hours → 200+ GiB leanserver RSS growth with
+        # processes/min * hours -> 200+ GiB leanserver RSS growth with
         # ~350 live branches (i.e. the leak is in retained *dead* processes,
         # not live branches).  return_process_async pops checkpoints on the
         # terminate path, but _destroy_process bypasses return_process_async.
@@ -268,7 +268,7 @@ class LeanServer:
         except concurrent.futures.TimeoutError:
             self.logger.error(
                 f"_release_slot for poisoned process {process_id} did not complete in "
-                f"{RELEASE_SLOT_TIMEOUT}s — pool slot accounting may drift"
+                f"{RELEASE_SLOT_TIMEOUT}s - pool slot accounting may drift"
             )
         if reason:
             self.logger.warning(f"Destroyed poisoned process {process_id}: {reason}")
@@ -301,7 +301,7 @@ class LeanServer:
         except concurrent.futures.TimeoutError:
             self.logger.error(
                 f"stop_async_safe on orphaned process did not complete in "
-                f"{STOP_ASYNC_TIMEOUT}s — leaking the subprocess to avoid blocking the loop"
+                f"{STOP_ASYNC_TIMEOUT}s - leaking the subprocess to avoid blocking the loop"
             )
         except Exception as e:
             self.logger.warning(f"Error stopping orphaned process: {e}")
@@ -318,7 +318,7 @@ class LeanServer:
         except concurrent.futures.TimeoutError:
             self.logger.error(
                 f"_release_slot for orphaned process did not complete in "
-                f"{RELEASE_SLOT_TIMEOUT}s — pool slot accounting may drift"
+                f"{RELEASE_SLOT_TIMEOUT}s - pool slot accounting may drift"
             )
         except Exception as e:
             self.logger.warning(f"Error releasing slot for orphaned process: {e}")
@@ -344,7 +344,7 @@ class LeanServer:
                 raise ValueError(f"Branch {branch_id} not found for process {process_id}")
             self._branch_last_used[key] = time.time()
             branch = self._branches[key]
-        # Refresh the process's _last_used too — otherwise a worker that only
+        # Refresh the process's _last_used too - otherwise a worker that only
         # hits try_apply_tactic / branch/state (never _get_process) can have
         # its process reaped out from under it.
         self._processes.touch(process_id)
@@ -380,7 +380,7 @@ class LeanServer:
         Adds ``RUN_ASYNC_HEADROOM`` so the coroutine has a chance to enforce
         its own deadline (and emit a meaningful ``LeanProcessException``)
         before the outer threadsafe wait gives up with a generic TimeoutError.
-        Forgetting this headroom used to be a latent-deadlock footgun — the
+        Forgetting this headroom used to be a latent-deadlock footgun - the
         outer wait would fire first, cancel observation of the coroutine, and
         the inner operation would never surface its real error.
         """
@@ -452,13 +452,13 @@ class LeanServer:
                     except concurrent.futures.TimeoutError:
                         self.logger.error(
                             f"return_process_async for leaked process {pid} exceeded "
-                            f"{RETURN_PROCESS_TIMEOUT}s — destroying orphaned process"
+                            f"{RETURN_PROCESS_TIMEOUT}s - destroying orphaned process"
                         )
                         self._destroy_untracked_process(
                             process, reason=f"reaper return timed out for process_id={pid}"
                         )
                     except Exception as e:
-                        self.logger.error(f"Error returning leaked process {pid}: {e} — destroying orphaned process")
+                        self.logger.error(f"Error returning leaked process {pid}: {e} - destroying orphaned process")
                         self._destroy_untracked_process(
                             process, reason=f"reaper return raised: {type(e).__name__}: {e}"
                         )
@@ -613,13 +613,13 @@ class LeanServer:
                 The body runs inside the context and is expected to call
                 ``server._run_async_op(...)`` with ``op_timeout`` as its
                 inner deadline (the context manager only dispatches on the
-                outer exception type — it doesn't run the coroutine itself).
+                outer exception type - it doesn't run the coroutine itself).
 
                 On ``concurrent.futures.TimeoutError`` or ``LeanProcessException``
                 the process is destroyed (slot released, subprocess stopped,
                 ``pool.checkpoints`` evicted) and the appropriate HTTP error is
                 sent.  On any other ``Exception`` the process is left alone
-                (the failure may be unrelated to the Lean subprocess — e.g.
+                (the failure may be unrelated to the Lean subprocess - e.g.
                 malformed request JSON) and a generic 500 is sent.
 
                 Collapses ~160 lines of near-identical try/except blocks
@@ -635,7 +635,7 @@ class LeanServer:
                 except concurrent.futures.TimeoutError:
                     server.logger.error(
                         f"{op_name} on process {process_id} did not complete in "
-                        f"{total_timeout}s — destroying process"
+                        f"{total_timeout}s - destroying process"
                     )
                     server._destroy_process(
                         process_id,
@@ -656,7 +656,7 @@ class LeanServer:
                 counts (LeanProofBranch, LeanGoal, LeanProcess) and the
                 process's current RSS.
 
-                This uses `gc.get_objects()` — no external profiling tools
+                This uses `gc.get_objects()` - no external profiling tools
                 required, no tracemalloc overhead.  sys.getsizeof only
                 accounts for the object's own header + immediate payload
                 (not referenced objects), so a 10 MB string shows as 10 MB
@@ -665,7 +665,7 @@ class LeanServer:
                 when RSS is climbing.
 
                 Walking the object graph briefly pauses Python execution
-                (GIL held) — typically <1 s for millions of objects.
+                (GIL held) - typically <1 s for millions of objects.
                 """
                 import gc
                 import sys
@@ -791,7 +791,7 @@ class LeanServer:
                         self._send_json(200, {"process_id": process_id})
                 except concurrent.futures.TimeoutError:
                     server.logger.error(
-                        f"get_process_async exceeded {timeout + RUN_ASYNC_HEADROOM}s on the event loop — "
+                        f"get_process_async exceeded {timeout + RUN_ASYNC_HEADROOM}s on the event loop - "
                         f"loop is unresponsive (send SIGUSR1 for a thread dump)"
                     )
                     self._send_error(503, "leanserver event loop is unresponsive")
@@ -810,13 +810,13 @@ class LeanServer:
                         except concurrent.futures.TimeoutError:
                             server.logger.error(
                                 f"return_process_async after client disconnect did not complete in "
-                                f"{RETURN_PROCESS_TIMEOUT}s — destroying orphaned process"
+                                f"{RETURN_PROCESS_TIMEOUT}s - destroying orphaned process"
                             )
                             server._destroy_untracked_process(
                                 process, reason="return timed out after client disconnect"
                             )
                         except Exception as e:
-                            server.logger.error(f"Error returning process after client disconnect: {e} — destroying orphaned process")
+                            server.logger.error(f"Error returning process after client disconnect: {e} - destroying orphaned process")
                             server._destroy_untracked_process(
                                 process, reason=f"return raised after client disconnect: {type(e).__name__}: {e}"
                             )
@@ -861,7 +861,7 @@ class LeanServer:
                 # success response to a disconnected client (common when a
                 # client hard-exits, e.g. stress_test Ctrl+C with daemon
                 # threads) would be mis-attributed to return_process_async
-                # and destroy a process that's already healthy in the pool —
+                # and destroy a process that's already healthy in the pool -
                 # leaving a dead LeanProcess in pool.available_processes for
                 # the next get_process to hand out.
                 try:
@@ -872,7 +872,7 @@ class LeanServer:
                 except concurrent.futures.TimeoutError:
                     server.logger.error(
                         f"return_process_async for process {process_id} exceeded "
-                        f"{RETURN_PROCESS_TIMEOUT}s — destroying orphaned process to avoid leak"
+                        f"{RETURN_PROCESS_TIMEOUT}s - destroying orphaned process to avoid leak"
                     )
                     server._destroy_untracked_process(
                         process, reason=f"return_process_async timed out for process_id={process_id}"
@@ -899,7 +899,7 @@ class LeanServer:
                         return [branch async for branch in process.proofs_from_sorries_async(theorem_with_sorry)]
 
                     # LeanInteractionException is a business-level error (bad theorem
-                    # input, not a process failure) — return 200 with an error payload
+                    # input, not a process failure) - return 200 with an error payload
                     # rather than destroying the process.  Intercept before it escapes
                     # to the context manager.
                     try:

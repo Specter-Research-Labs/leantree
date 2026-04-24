@@ -18,7 +18,7 @@ class ProofTreePostprocessor:
             cls._replace_nested_tactics_with_sorries(node)
             # _remove_by_sorry_in_have is disabled: in Lean 4.27+, bodyless `have h : T`
             # (without `:= by sorry`) is no longer valid tactic syntax.  Keeping the
-            # `:= by sorry` body works correctly — the REPL creates a sorry branch that
+            # `:= by sorry` body works correctly - the REPL creates a sorry branch that
             # the tree builder matches to the spawned_goals child.
             cls._transform_with_cases(node)
             cls._transform_case_tactic(node)
@@ -167,14 +167,14 @@ class ProofTreePostprocessor:
     @classmethod
     def _find_induction_alts(cls, ast_node, tactic_name: str) -> list[str] | None:
         """Extract constructor names from cases/induction AST by finding the inductionAlts node.
-        Returns None if not found — this happens when BetterParser already decomposed the
+        Returns None if not found - this happens when BetterParser already decomposed the
         alternatives into separate proof steps (each branch is its own step with goal matching)."""
         alts_node = ast_node.find_first_node(
             lambda n: isinstance(n, LeanASTObject) and n.type == "Tactic.inductionAlts"
         )
         if alts_node is None:
             return None
-        # Structure can vary — return None if unexpected so caller can skip transform.
+        # Structure can vary - return None if unexpected so caller can skip transform.
         if len(alts_node.args) < 3 or alts_node.args[0].pretty_print() != "with":
             return None
         alts = alts_node.args[2]
@@ -307,7 +307,7 @@ class ProofTreePostprocessor:
 
         by_block_count = sum(1 for s in steps if s["is_by"])
         if by_block_count != len(node.tactic.spawned_goals):
-            # Unexpected mismatch — bail and leave calc as a single atomic step.
+            # Unexpected mismatch - bail and leave calc as a single atomic step.
             return
 
         # Build relation strings per step, substituting `_` with the previous step's RHS.

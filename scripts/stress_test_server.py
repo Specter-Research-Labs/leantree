@@ -38,7 +38,7 @@ TACTICS_NICE = [
 # Rotation for the `hold` worker: each native_decide materializes a huge list
 # at elab time, driving multi-GB transient allocations in the LeanServer.
 # With many workers hitting heavy steps concurrently, peak RSS easily exceeds
-# physical RAM — tune sizes down (or worker count) if the box OOMs.
+# physical RAM - tune sizes down (or worker count) if the box OOMs.
 TACTICS_HOLD = [
     "skip",
     # ~12 GB transient: 500M-cons list, traverse to length

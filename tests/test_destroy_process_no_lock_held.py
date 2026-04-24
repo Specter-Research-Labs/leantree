@@ -4,14 +4,14 @@
 Before: `_destroy_process` acquired `self._lock` and then called
 `_run_async(stop_async_safe)` + `_run_async(_release_slot)` inside the
 same `with self._lock:` block.  If either coroutine stalled on the loop,
-the lock was held the whole time — every subsequent handler that needed
+the lock was held the whole time - every subsequent handler that needed
 it (status, get_process_id, return_process, ...) blocked for the entire
 duration of the stall.  That was failure mode #2 in the plan.
 
 After A2, the lock is released before the `_run_async` calls.  This test
 monkey-patches `_run_async` to spin for 5 s, kicks off `_destroy_process`
 from one thread, and from another thread asserts that a call which
-*also* needs `self._lock` (`_get_process_id`) returns within ~100 ms —
+*also* needs `self._lock` (`_get_process_id`) returns within ~100 ms -
 i.e. is NOT blocked behind the slow `_run_async`.
 """
 
@@ -79,7 +79,7 @@ def running_server():
 def test_destroy_process_does_not_hold_self_lock_across_run_async(running_server):
     """Slow-poke `_run_async`, call `_destroy_process` from one thread,
     and concurrently call `_get_process_id` from another.  The second
-    call must return promptly — it would hang if A2 regressed."""
+    call must return promptly - it would hang if A2 regressed."""
     server = running_server
 
     # Register a fake process so _destroy_process has something to destroy.
@@ -92,7 +92,7 @@ def test_destroy_process_does_not_hold_self_lock_across_run_async(running_server
 
     def _slow_run_async(coro, timeout=None):
         entered.set()
-        # Don't hang forever — block only until the test signals release.
+        # Don't hang forever - block only until the test signals release.
         release.wait(timeout=10.0)
         # Still invoke the original so the coroutine doesn't leak.
         return original_run_async(coro, timeout=1.0)
@@ -115,7 +115,7 @@ def test_destroy_process_does_not_hold_self_lock_across_run_async(running_server
         elapsed = time.monotonic() - t0
 
         assert elapsed < 0.5, (
-            f"_get_process_id blocked for {elapsed:.2f}s while _destroy_process was in _run_async — "
+            f"_get_process_id blocked for {elapsed:.2f}s while _destroy_process was in _run_async - "
             "self._lock is held across the loop boundary (A2 regression)"
         )
         assert isinstance(other_id, int)

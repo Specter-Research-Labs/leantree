@@ -157,7 +157,7 @@ def test_return_process_timeout_destroys_orphan_not_leaks(running_server):
         time.sleep(0.1)
 
     assert process not in server.pool.checkpoints, (
-        "process still in pool.checkpoints after handler timeout — leak regression. "
+        "process still in pool.checkpoints after handler timeout - leak regression. "
         "This is the production bug from 2026-04-21 h5 (82 live repl children, 181 GB RAM)."
     )
     assert server.pool._num_used_processes == 0, (

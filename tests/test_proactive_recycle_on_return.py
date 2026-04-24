@@ -68,7 +68,7 @@ def test_recycle_triggers_when_pss_exceeds_threshold_under_rlimit_as():
     # Threshold should be 16 GiB.
     assert pool.memory_threshold_per_process == rlimit // 2
 
-    # Process is "bloated" — PSS at 20 GiB, above the 16 GiB recycle threshold.
+    # Process is "bloated" - PSS at 20 GiB, above the 16 GiB recycle threshold.
     process = _make_mock_process(pss_bytes=20 * 1024**3)
     pool.checkpoints[process] = LeanEnvironmentCheckpoint(env_id=1)
     pool._num_used_processes = 1
