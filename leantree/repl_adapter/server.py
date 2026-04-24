@@ -929,7 +929,7 @@ class LeanServer:
                 tactic_timeout_ms = data.get("timeout", DEFAULT_TRY_APPLY_TACTIC_MS)
                 # tactic timeout is ms in the payload; _run_async_op takes seconds.
                 op_timeout_s = tactic_timeout_ms / 1000.0
-                op_name = f"try_apply_tactic (branch {branch_id})"
+                op_name = f"try_apply_tactic (branch {branch_id}, tactic={tactic!r})"
                 with self._process_op_errors(process_id, op_name, op_timeout_s):
                     branch = server._get_branch(process_id, branch_id)
                     result = server._run_async_op(
