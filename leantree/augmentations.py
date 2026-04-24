@@ -6,7 +6,21 @@ from leantree import LeanGoal, ProofTreeNode, LeanProofState, LeanFile, StoredEr
 
 
 class ShuffleGoalsAndHypotheses:
-    def __init__(self, shuffle_prob: float = 0.8, seed: int | None = None):
+    """
+    Augment a node by randomly reordering hypotheses within each goal.
+
+    Note that this can render the state invalid, e.g. when hypotheses depend on each other. Consider:
+    ```
+    α : Type
+    x : α
+    h : x = x
+    ⊢ True
+    ```
+    Or when the tactic depends on the order of the hypotheses.
+    We partially mitigate the latter by filtering out common tactics that would break, such as rename_i, simp_all, subst_vars.
+    """
+
+    def __init__(self, shuffle_prob: float = 1.0, seed: int | None = None):
         self.shuffle_prob = shuffle_prob
         self.seed = seed
         self.rng = random.Random(seed)
@@ -17,20 +31,25 @@ class ShuffleGoalsAndHypotheses:
         return goal.with_(hypotheses=shuffled)
 
     def run_on_goals(self, goals: list[LeanGoal]) -> list[LeanGoal]:
-        # Goal order is meaningful: tactics act on the focused (first) goal, so reordering the
-        # list would change the semantics of the recorded (state, tactic) pair. Only shuffle
-        # hypotheses within each goal.
         if self.rng.random() < self.shuffle_prob:
             return [self.run_on_goal(goal) for goal in goals]
         else:
             return goals
 
     def run(self, node: ProofTreeNode) -> ProofTreeNode:
+        if node.tactic is not None:
+            tactic = node.tactic.tactic.tactic
+            if tactic == "rename_i" or tactic.startswith("simp") or tactic.startswith("subst"):
+                return node
         return node.with_(state=LeanProofState(self.run_on_goals(node.state.goals)))
 
 
 class RandomRename:
-    def __init__(self, rename_prob: float = 0.8, seed: int | None = None):
+    """Augment a node by alpha-renaming hypotheses and goal tags, rewriting the tactic
+    string so the renamed names stay in sync.
+    """
+
+    def __init__(self, rename_prob: float = 0.5, seed: int | None = None):
         self.rename_prob = rename_prob
         self.seed = seed
         self.rng = random.Random(seed)
@@ -42,9 +61,9 @@ class RandomRename:
         goals, tactic = node.state.goals, node.tactic.tactic.tactic
 
         goals, tactic = self.run_on_goals(goals, tactic)
-
         new_lean_tactic = replace(node.tactic.tactic, tactic=tactic)
         new_edge = replace(node.tactic, tactic=new_lean_tactic)
+
         node = node.with_(state=LeanProofState(goals), tactic=new_edge)
         return node
 
@@ -58,6 +77,8 @@ SUBSCRIPTS = ["₀", "₁", "₂", "₃", "₄", "₅", "₆", "₇", "₈", "�
 
 
 def _generate_random_name(length: int, avoid_names: set[str], rng=random) -> str:
+    """Return a fresh ASCII-letter identifier of the given length (with 20% chance of a
+    trailing subscript digit) that is not in `avoid_names`."""
     chars = string.ascii_letters
     for _ in range(100):
         new_name = "".join(rng.choice(chars) for _ in range(length))
@@ -69,8 +90,12 @@ def _generate_random_name(length: int, avoid_names: set[str], rng=random) -> str
 
 
 def _replace_name(text: str, old_name: str, new_name: str) -> str:
+    """Replace every whole-identifier occurrence of `old_name` in `text` with `new_name`.
+
+    Matches are bounded by non-identifier characters on both sides. `.` is treated as
+    identifier-like so that qualified names like `Foo.bar` are not partially matched.
+    """
     def is_identifier_like(c):
-        # `.` is included so that qualified names like `Foo.bar` are not matched when renaming `bar`.
         return c.isalnum() or c == "_" or c == "'" or c == "."
 
     result = []
@@ -95,15 +120,21 @@ def _replace_name(text: str, old_name: str, new_name: str) -> str:
 
 
 def _ban_name(avoid_names: set[str], name: str) -> None:
-    # When `foo✝` is banned, also ban `foo`: a candidate name is used as-is for normal
-    # hypotheses, but for ✝-suffixed hypotheses we later strip the last char and append `✝`,
-    # so any candidate of the form `foo?` would transform to `foo✝` and collide.
+    """Add `name` to `avoid_names`, and if it ends with `✝`, also add its ✝-less prefix.
+
+    For ✝-suffixed hypotheses a candidate is generated without `✝` and then has its last
+    char replaced with `✝`, so banning only the ✝-form would let a shorter prefix collide.
+    """
     avoid_names.add(name)
     if name.endswith("✝"):
         avoid_names.add(name[:-1])
 
 
 def _random_rename_variables_in_goal(goal: LeanGoal, rng=random) -> tuple[LeanGoal, dict[str, str]]:
+    """Rename each hypothesis with 50% probability, propagating each rename into all
+    hypothesis types/values and the goal type. Returns the new goal and the
+    `old_name -> new_name` substitution that was applied.
+    """
     avoid_names: set[str] = set()
     for h in goal.hypotheses:
         _ban_name(avoid_names, h.user_name)
@@ -119,7 +150,7 @@ def _random_rename_variables_in_goal(goal: LeanGoal, rng=random) -> tuple[LeanGo
         old_name = h.user_name
 
         if rng.random() < 0.5:
-            new_name = _generate_random_name(len(old_name), avoid_names, rng=rng)
+            new_name = _generate_random_name(min(len(old_name), 2), avoid_names, rng=rng)
             if "✝" in old_name:
                 # ✝ marks that the name is not accessible, which has semantic meaning
                 assert len(old_name) >= 2
@@ -148,6 +179,9 @@ def _random_rename_variables_in_goal(goal: LeanGoal, rng=random) -> tuple[LeanGo
     return goal.with_(hypotheses=current_hypotheses, type=current_goal_type), replacements
 
 def random_rename_variables(goals: list[LeanGoal], tactic: str, rng=random) -> tuple[list[LeanGoal], str]:
+    """Apply `_random_rename_variables_in_goal` to each goal and rewrite `tactic` with the
+    accumulated substitution. When the same hypothesis name appears in multiple goals, the
+    first goal's rename wins for the purpose of rewriting the tactic."""
     new_goals = []
     all_replacements = {}
     
@@ -164,10 +198,14 @@ def random_rename_variables(goals: list[LeanGoal], tactic: str, rng=random) -> t
     return new_goals, tactic
 
 def _tag_rename_is_ambiguous(old_name: str, this_goal: LeanGoal, goals: list[LeanGoal], tactic: str) -> bool:
-    # A standalone identifier match of `old_name` outside of `this_goal.tag` itself means we
-    # cannot tell whether the occurrence is the tag or an unrelated identifier that happens to
-    # spell the same (e.g. a fresh name introduced by the tactic, a bound variable in a type).
-    # Skip the rename rather than risk corrupting (state, tactic) semantics.
+    """Return True if `old_name` appears as a standalone identifier anywhere outside
+    `this_goal.tag` itself (tactic, any goal's type, any hypothesis name/type/value).
+
+    In that case we cannot tell whether a given occurrence is the tag or an unrelated
+    identifier that happens to spell the same (e.g. a fresh name introduced by the tactic,
+    a bound variable in a type). Callers skip the rename rather than risk corrupting the
+    (state, tactic) semantics.
+    """
     sentinel = "\x00"
 
     def appears(text: str) -> bool:
@@ -183,6 +221,9 @@ def _tag_rename_is_ambiguous(old_name: str, this_goal: LeanGoal, goals: list[Lea
 
 
 def random_rename_goals(goals: list[LeanGoal], tactic: str, rng=random) -> tuple[list[LeanGoal], str]:
+    """Randomly rename, drop, or leave each goal's tag. Tagged goals whose tag name is
+    ambiguous (see `_tag_rename_is_ambiguous`) are left untouched; untagged goals get a
+    fresh tag with 50% probability. The tactic is returned unchanged."""
     avoid_names = set()
     for g in goals:
         if g.tag:
@@ -205,7 +246,7 @@ def random_rename_goals(goals: list[LeanGoal], tactic: str, rng=random) -> tuple
             # cannot desynchronize any other text. The tactic is left unchanged.
             rand_val = rng.random()
             if rand_val < 1/3:
-                new_name = _generate_random_name(min(len(old_name), 6), avoid_names, rng=rng)
+                new_name = _generate_random_name(min(len(old_name), 5), avoid_names, rng=rng)
                 avoid_names.add(new_name)
                 updated_goal = g.with_(tag=new_name)
             elif rand_val < 2/3:
