@@ -11,6 +11,7 @@ python = ">=3.12"
 numpy = ">=1.26.4"
 tqdm = ">=4.67.0"
 PrettyPrintTree = ">=2.0.1"
+cmd2 = "<3"
 psutil = ">=6.1.0"
 
 [tool.poetry.group.dev]
