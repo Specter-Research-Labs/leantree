@@ -190,6 +190,12 @@ def main():
         help="Pre-start all processes to max capacity before accepting requests"
     )
     parser.add_argument(
+        "--warmup-batch-size",
+        type=int,
+        default=32,
+        help="Start warmup processes in batches of this size to limit resource contention; <=0 disables batching (default: 32)"
+    )
+    parser.add_argument(
         "--rss-hard-limit-gib",
         type=float,
         default=32.0,
@@ -271,14 +277,19 @@ def main():
     logger.info(f"REPL executable: {repl_exe}")
     if args.imports:
         logger.info(f"Importing packages: {", ".join(args.imports)}")
+    warmup_batch_size = args.warmup_batch_size if args.warmup_batch_size and args.warmup_batch_size > 0 else None
     if args.warmup:
-        logger.info(f"Warming up {args.max_processes} processes before accepting requests")
+        if warmup_batch_size:
+            logger.info(f"Warming up {args.max_processes} processes in batches of {warmup_batch_size} before accepting requests")
+        else:
+            logger.info(f"Warming up {args.max_processes} processes before accepting requests")
     server = start_server(
         pool,
         address=args.address,
         port=args.port,
         log_level=args.log_level,
         warmup=args.warmup,
+        warmup_batch_size=warmup_batch_size,
     )
     logger.info(f"Server accepting requests on http://{args.address}:{args.port} with log level {args.log_level}")
 

@@ -1262,14 +1262,17 @@ def start_server(
         port: int = 8000,
         log_level: str = "INFO",
         warmup: bool = False,
+        warmup_batch_size: int | None = None,
 ) -> LeanServer:
     """Start a LeanServer with the given pool.
 
     If ``warmup`` is True, pre-start processes up to ``pool.max_processes``
     and block until they are ready *before* the HTTP server accepts requests.
+    If ``warmup_batch_size`` is set, processes are started in batches of that
+    size to limit I/O/memory contention during warmup.
     """
     server = LeanServer(pool, address, port, log_level)
-    warmup_coro = pool.max_out_processes_async() if warmup else None
+    warmup_coro = pool.max_out_processes_async(batch_size=warmup_batch_size) if warmup else None
     server.start(warmup_coro=warmup_coro)
     return server
 
