@@ -173,6 +173,11 @@ class LeanServer:
         self._event_loop = None
         self._loop_thread = None
 
+        # Warmup gating. When a warmup_coro is passed to start(), this flips to
+        # True only after it completes; /process/get rejects with 503 until then.
+        # Default True so servers started without warmup immediately accept requests.
+        self._warmup_complete: bool = True
+
         # Branch tracking: maps (process_id, branch_id) to LeanProofBranch
         self._branch_id_counter = 0
         self._branches: dict[tuple[int, int], LeanProofBranch] = {}
@@ -458,8 +463,15 @@ class LeanServer:
                             process, reason=f"reaper return raised: {type(e).__name__}: {e}"
                         )
 
-    def start(self):
-        """Start the HTTP server."""
+    def start(self, warmup_coro=None):
+        """Start the HTTP server.
+
+        If ``warmup_coro`` is given, the HTTP listener comes up immediately
+        (so ``/status`` is queryable during warmup) but ``/process/get``
+        returns 503 until the coroutine completes. This prevents clients from
+        racing warmup and triggering extra ``_create_process_async`` calls on
+        top of the warmup spawns, while keeping the server introspectable.
+        """
         if self.server is not None:
             raise RuntimeError("Server already started")
 
@@ -476,6 +488,9 @@ class LeanServer:
         while self._event_loop is None:
             time.sleep(0.01)
 
+        if warmup_coro is not None:
+            self._warmup_complete = False
+
         handler = self._create_handler()
         self.server = ThreadingHTTPServer((self.address, self.port), handler)
 
@@ -484,6 +499,15 @@ class LeanServer:
 
         self.server_thread = threading.Thread(target=run_server, daemon=True)
         self.server_thread.start()
+
+        # Run warmup after the HTTP listener is up so /status stays reachable
+        # while it runs. Block start() until it completes so callers can log
+        # "ready" in the obvious order.
+        if warmup_coro is not None:
+            try:
+                self._run_async(warmup_coro)
+            finally:
+                self._warmup_complete = True
 
         # Start the lease-timeout reaper to reclaim leaked processes
         self._reaper_thread = threading.Thread(
@@ -714,6 +738,7 @@ class LeanServer:
                     total_branches = len(server._branch_last_used)
                 
                 status = {
+                    "status": "ready" if server._warmup_complete else "warming_up",
                     "available_processes": available,
                     "used_processes": used,
                     "starting_processes": starting,
@@ -738,6 +763,15 @@ class LeanServer:
                 self._send_json(200, status)
 
             def _handle_get_process(self):
+                # Reject while warmup is running. Otherwise these requests race
+                # warmup: available_processes is empty (gather only publishes at
+                # the end) and _num_used_processes is 0, so _get_or_create_process_async
+                # spawns an extra REPL on top of the warmup N, piling onto an
+                # already saturated system.
+                if not server._warmup_complete:
+                    self._send_error(503, "server is warming up")
+                    return
+
                 data = self._read_json()
                 blocking = data.get("blocking", True)
                 # Default timeout of 1 minute to prevent indefinite blocking
@@ -1226,11 +1260,17 @@ def start_server(
         pool: LeanProcessPool,
         address: str = "localhost",
         port: int = 8000,
-        log_level: str = "INFO"
+        log_level: str = "INFO",
+        warmup: bool = False,
 ) -> LeanServer:
-    """Start a LeanServer with the given pool."""
+    """Start a LeanServer with the given pool.
+
+    If ``warmup`` is True, pre-start processes up to ``pool.max_processes``
+    and block until they are ready *before* the HTTP server accepts requests.
+    """
     server = LeanServer(pool, address, port, log_level)
-    server.start()
+    warmup_coro = pool.max_out_processes_async() if warmup else None
+    server.start(warmup_coro=warmup_coro)
     return server
 
 

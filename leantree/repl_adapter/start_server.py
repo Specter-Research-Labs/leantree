@@ -271,17 +271,16 @@ def main():
     logger.info(f"REPL executable: {repl_exe}")
     if args.imports:
         logger.info(f"Importing packages: {", ".join(args.imports)}")
+    if args.warmup:
+        logger.info(f"Warming up {args.max_processes} processes before accepting requests")
     server = start_server(
         pool,
         address=args.address,
         port=args.port,
-        log_level=args.log_level
+        log_level=args.log_level,
+        warmup=args.warmup,
     )
-    logger.info(f"Server started on http://{args.address}:{args.port} with log level {args.log_level}")
-
-    # Warmup: pre-start all processes if requested (must be done after server starts to use its event loop)
-    if args.warmup:
-        server._run_async(pool.max_out_processes_async())
+    logger.info(f"Server accepting requests on http://{args.address}:{args.port} with log level {args.log_level}")
 
     # Handle shutdown gracefully
     _shutting_down = False
