@@ -99,19 +99,19 @@ def keyboard_monitor(address: str, port: int, pool: LeanProcessPool):
                 # Per-process memory. Snapshot pool.checkpoints.keys() so we don't iterate
                 # a dict being mutated by the event loop. Skip processes that fail to report
                 # (may be mid-shutdown) and keep RSS/PSS aligned by appending together.
-                rss_values: list[float] = []
-                pss_values: list[float] = []
-                for process in list(pool.checkpoints.keys()):
-                    try:
-                        rss = process.memory_usage_rss()
-                        pss = process.memory_usage_pss()
-                    except Exception:
-                        continue
-                    rss_values.append(rss / (1024**3))
-                    pss_values.append(pss / (1024**3))
-                sorted_pairs = sorted(zip(rss_values, pss_values), key=lambda p: p[0], reverse=True)
-                print(f"PSS (GB): {' '.join(f'{p:.2f}' for _, p in sorted_pairs)}")
-                print(f"RSS (GB): {' '.join(f'{r:.2f}' for r, _ in sorted_pairs)}")
+                # rss_values: list[float] = []
+                # pss_values: list[float] = []
+                # for process in list(pool.checkpoints.keys()):
+                #     try:
+                #         rss = process.memory_usage_rss()
+                #         pss = process.memory_usage_pss()
+                #     except Exception:
+                #         continue
+                #     rss_values.append(rss / (1024**3))
+                #     pss_values.append(pss / (1024**3))
+                # sorted_pairs = sorted(zip(rss_values, pss_values), key=lambda p: p[0], reverse=True)
+                # print(f"PSS (GB): {' '.join(f'{p:.2f}' for _, p in sorted_pairs)}")
+                # print(f"RSS (GB): {' '.join(f'{r:.2f}' for r, _ in sorted_pairs)}")
 
                 # Show active requests
                 active_requests = status.get('active_requests', [])
