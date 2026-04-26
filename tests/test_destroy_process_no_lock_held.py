@@ -32,12 +32,11 @@ class _FakePool:
     def __init__(self, max_processes: int = 2):
         self.max_processes = max_processes
         self.available_processes = []
-        self._num_used_processes = 1  # so _release_slot decrement is non-negative
+        self._num_used_processes = 1  # so release_slot decrement is non-negative
         self._num_starting_processes = 0
         self._lock = None
-        self._process_available_event = None
-        # _destroy_process's _release_slot pops this dict; without it the
-        # coroutine raises AttributeError (silently, in a background thread).
+        # release_slot_async pops this dict; without it the coroutine
+        # raises AttributeError (silently, in a background thread).
         self.checkpoints: dict = {}
 
     @property
@@ -47,12 +46,11 @@ class _FakePool:
             self._lock = asyncio.Lock()
         return self._lock
 
-    @property
-    def process_available_event(self):
-        import asyncio
-        if self._process_available_event is None:
-            self._process_available_event = asyncio.Event()
-        return self._process_available_event
+    async def release_slot_async(self, process):
+        async with self.lock:
+            self.checkpoints.pop(process, None)
+            if self._num_used_processes > 0:
+                self._num_used_processes -= 1
 
     async def shutdown_async(self):
         return None

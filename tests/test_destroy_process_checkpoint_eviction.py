@@ -31,10 +31,9 @@ class _FakePool:
     def __init__(self, max_processes: int = 2):
         self.max_processes = max_processes
         self.available_processes = []
-        self._num_used_processes = 1  # something for _release_slot to decrement
+        self._num_used_processes = 1  # something for release_slot_async to decrement
         self._num_starting_processes = 0
         self._lock = None
-        self._process_available_event = None
         # The dict we're asserting gets popped.
         self.checkpoints: dict = {}
 
@@ -44,11 +43,11 @@ class _FakePool:
             self._lock = asyncio.Lock()
         return self._lock
 
-    @property
-    def process_available_event(self):
-        if self._process_available_event is None:
-            self._process_available_event = asyncio.Event()
-        return self._process_available_event
+    async def release_slot_async(self, process):
+        async with self.lock:
+            self.checkpoints.pop(process, None)
+            if self._num_used_processes > 0:
+                self._num_used_processes -= 1
 
     async def shutdown_async(self):
         return None

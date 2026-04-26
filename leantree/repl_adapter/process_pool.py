@@ -1,4 +1,3 @@
-import time
 import asyncio
 import logging
 from pathlib import Path
@@ -63,7 +62,14 @@ class LeanProcessPool:
         self._num_starting_processes: int = 0
         # Lazily initialized asyncio primitives (to bind to correct event loop)
         self._lock: asyncio.Lock | None = None
-        self._process_available_event: asyncio.Event | None = None
+        # Slot semaphore: count == max_processes - _num_used_processes.  Each
+        # acquire reserves one slot; each release wakes EXACTLY ONE waiter
+        # (unlike the asyncio.Event we used to use, which broadcast to all
+        # waiters and produced a thundering herd that froze the loop in
+        # production - one return -> 60+ get_process_async coroutines all
+        # scheduled in one tick, all contesting self.lock, all but one
+        # losing and re-arming their wait).
+        self._slots: asyncio.Semaphore | None = None
         self.env_setup_async = env_setup_async
 
         self._was_shutdown = False
@@ -76,11 +82,11 @@ class LeanProcessPool:
         return self._lock
 
     @property
-    def process_available_event(self) -> asyncio.Event:
-        """Lazily create the event to bind to the correct event loop."""
-        if self._process_available_event is None:
-            self._process_available_event = asyncio.Event()
-        return self._process_available_event
+    def slots(self) -> asyncio.Semaphore:
+        """Lazily create the slot semaphore (binds to the running event loop)."""
+        if self._slots is None:
+            self._slots = asyncio.Semaphore(self.max_processes)
+        return self._slots
 
     async def _create_process_async(self) -> LeanProcess:
         """Create a new LeanProcess instance.
@@ -157,54 +163,14 @@ class LeanProcessPool:
             new_processes = await asyncio.gather(*tasks)
             async with self.lock:
                 self.available_processes.extend(new_processes)
-                if self.available_processes:
-                    self.process_available_event.set()
+            # No slot release: warmup didn't increment _num_used_processes,
+            # so slots stayed at max_processes throughout - the new idle
+            # processes are immediately acquirable by the next acquire().
             remaining -= current_batch
 
         self.logger.info(
             f"Started {processes_to_start} processes. Available: {len(self.available_processes)}, Used: {self._num_used_processes}"
         )
-
-    async def _get_or_create_process_async(self) -> LeanProcess | None:
-        """Try to get an available process or reserve a slot and create one.
-
-        Returns a process if one was available or successfully created,
-        None if at capacity with no available processes.
-
-        The lock is only held briefly to check/update counters; the slow
-        process creation happens outside the lock.
-        """
-        async with self.lock:
-            if self._was_shutdown:
-                raise RuntimeError("Process pool has been shut down")
-
-            if self.available_processes:
-                process = self.available_processes.pop()
-                if not self.available_processes:
-                    self.process_available_event.clear()
-                self._num_used_processes += 1
-                return process
-
-            # Reserve a slot for a new process (but create it outside the lock)
-            if self._num_used_processes < self.max_processes:
-                self._num_used_processes += 1
-                need_create = True
-            else:
-                need_create = False
-
-        if not need_create:
-            return None
-
-        # Create the process OUTSIDE the lock so returns aren't blocked
-        try:
-            process = await self._create_process_async()
-            return process
-        except Exception:
-            # Release the reserved slot on failure
-            async with self.lock:
-                self._num_used_processes -= 1
-                self.process_available_event.set()
-            raise
 
     async def get_process_async(self, blocking: bool = True, timeout: float | None = None) -> LeanProcess | None:
         """
@@ -221,36 +187,55 @@ class LeanProcessPool:
         Raises:
             RuntimeError: If the pool has been shut down
         """
-        process = await self._get_or_create_process_async()
-        if process is not None:
-            return process
-
-        # No processes available and at max capacity
+        # Step 1: acquire a slot.  asyncio.Semaphore wakes EXACTLY ONE
+        # waiter per release() - one return -> one wakeup, not 60+.
         if not blocking:
-            return None
-
-        # Wait for a process to become available asynchronously
-        start_time = time.monotonic()
-        while True:
-            # Calculate remaining time if timeout is set
-            if timeout is not None:
-                elapsed = time.monotonic() - start_time
-                if elapsed >= timeout:
-                    return None  # Timeout expired
-                wait_timeout = min(5.0, timeout - elapsed)
-            else:
-                wait_timeout = 5.0
-
+            # asyncio.Semaphore has no try_acquire; use _value directly.
+            # locked() == False means value > 0 AND no other waiters, so
+            # decrementing here is fair (we don't jump anyone's queue).
+            slots = self.slots
+            if slots.locked():
+                return None
+            slots._value -= 1
+        elif timeout is not None:
             try:
-                # Wait for the event to be set with a timeout
-                await asyncio.wait_for(self.process_available_event.wait(), timeout=wait_timeout)
+                await asyncio.wait_for(self.slots.acquire(), timeout=timeout)
             except asyncio.TimeoutError:
-                # Continue waiting if timeout occurs (unless total timeout expired)
-                pass
+                return None
+        else:
+            await self.slots.acquire()
 
-            process = await self._get_or_create_process_async()
-            if process is not None:
-                return process
+        # Step 2: convert the slot to a process.  On any failure, release
+        # the slot so the next waiter (or this caller's retry) can use it.
+        try:
+            async with self.lock:
+                if self._was_shutdown:
+                    raise RuntimeError("Process pool has been shut down")
+
+                if self.available_processes:
+                    process = self.available_processes.pop()
+                    self._num_used_processes += 1
+                    return process  # slot ownership transferred to caller
+
+                # No idle process: slot lets us create a new one.
+                assert self._num_used_processes < self.max_processes, (
+                    "semaphore granted a slot but pool is at max_processes - "
+                    "accounting drift (slots vs. _num_used_processes)"
+                )
+                self._num_used_processes += 1
+            # Lock released; create OUTSIDE it so other returns aren't blocked.
+            try:
+                return await self._create_process_async()
+            except BaseException:
+                async with self.lock:
+                    self._num_used_processes -= 1
+                raise
+        except BaseException:
+            # Slot was acquired but never delivered to a caller.  Returning
+            # it propagates the wakeup to the next waiter (e.g. shutdown
+            # signal chain) so they can also see _was_shutdown.
+            self.slots.release()
+            raise
 
     async def return_process_async(self, process: LeanProcess):
         """
@@ -311,7 +296,7 @@ class LeanProcessPool:
                 self.checkpoints.pop(process, None)
                 assert self._num_used_processes > 0, "No processes in use"
                 self._num_used_processes -= 1
-                self.process_available_event.set()
+            self.slots.release()
             return
 
         # Drain and rollback outside the lock (drain is near-instant, rollback is just an int assignment)
@@ -323,10 +308,24 @@ class LeanProcessPool:
             assert self._num_used_processes > 0, "No processes in use"
             self._num_used_processes -= 1
             self.available_processes.append(process)
-            # Notify waiting coroutines that a process is available
-            self.process_available_event.set()
+        # Wake one waiter (not all - asyncio.Semaphore.release() is FIFO).
+        self.slots.release()
 
     return_process = to_sync(return_process_async)
+
+    async def release_slot_async(self, process: LeanProcess):
+        """Release a slot held by ``process`` without re-pooling it.
+
+        Used by server.py's destroy paths (poisoned process, orphaned process
+        after a return-path timeout) when the process is being torn down
+        outside the normal return flow.  Pops the checkpoint, decrements
+        the used count, and wakes one waiter.
+        """
+        async with self.lock:
+            self.checkpoints.pop(process, None)
+            if self._num_used_processes > 0:
+                self._num_used_processes -= 1
+        self.slots.release()
 
     def _log_recycle(self, reason: str, measured_pss: int | None):
         """Emit a single informative log line when a process is being recycled.
@@ -352,9 +351,6 @@ class LeanProcessPool:
                 return
             self._was_shutdown = True
 
-            # Wake up any coroutines waiting for processes so they can see _was_shutdown
-            self.process_available_event.set()
-
             # Shut down available processes
             for process in self.available_processes:
                 try:
@@ -363,5 +359,10 @@ class LeanProcessPool:
                     self.logger.warning(f"Error shutting down process: {e}")
             self.available_processes = []
             self.checkpoints.clear()
+
+        # Wake one waiter; the get_process_async chain (each woken waiter
+        # sees _was_shutdown, raises, and releases the slot) propagates the
+        # shutdown signal to all remaining waiters one-by-one.
+        self.slots.release()
 
     shutdown = to_sync(shutdown_async)

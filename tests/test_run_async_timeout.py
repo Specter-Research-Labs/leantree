@@ -50,19 +50,12 @@ class _FakePool:
         self._num_used_processes = 0
         self._num_starting_processes = 0
         self._lock = None
-        self._process_available_event = None
 
     @property
     def lock(self):
         if self._lock is None:
             self._lock = asyncio.Lock()
         return self._lock
-
-    @property
-    def process_available_event(self):
-        if self._process_available_event is None:
-            self._process_available_event = asyncio.Event()
-        return self._process_available_event
 
     async def get_process_async(self, blocking: bool = True, timeout: float | None = None):
         # Never returns a process - simulates a fully-occupied pool so the

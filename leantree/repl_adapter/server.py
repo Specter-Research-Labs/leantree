@@ -274,17 +274,11 @@ class LeanServer:
         # ~350 live branches (i.e. the leak is in retained *dead* processes,
         # not live branches).  return_process_async pops checkpoints on the
         # terminate path, but _destroy_process bypasses return_process_async.
-        async def _release_slot():
-            async with self.pool.lock:
-                self.pool.checkpoints.pop(process, None)
-                if self.pool._num_used_processes > 0:
-                    self.pool._num_used_processes -= 1
-                self.pool.process_available_event.set()
         try:
-            self._run_async(_release_slot(), timeout=RELEASE_SLOT_TIMEOUT)
+            self._run_async(self.pool.release_slot_async(process), timeout=RELEASE_SLOT_TIMEOUT)
         except concurrent.futures.TimeoutError:
             self.logger.error(
-                f"_release_slot for poisoned process {process_id} did not complete in "
+                f"release_slot_async for poisoned process {process_id} did not complete in "
                 f"{RELEASE_SLOT_TIMEOUT}s - pool slot accounting may drift"
             )
         if reason:
@@ -323,18 +317,11 @@ class LeanServer:
         except Exception as e:
             self.logger.warning(f"Error stopping orphaned process: {e}")
 
-        async def _release_slot():
-            async with self.pool.lock:
-                self.pool.checkpoints.pop(process, None)
-                if self.pool._num_used_processes > 0:
-                    self.pool._num_used_processes -= 1
-                self.pool.process_available_event.set()
-
         try:
-            self._run_async(_release_slot(), timeout=RELEASE_SLOT_TIMEOUT)
+            self._run_async(self.pool.release_slot_async(process), timeout=RELEASE_SLOT_TIMEOUT)
         except concurrent.futures.TimeoutError:
             self.logger.error(
-                f"_release_slot for orphaned process did not complete in "
+                f"release_slot_async for orphaned process did not complete in "
                 f"{RELEASE_SLOT_TIMEOUT}s - pool slot accounting may drift"
             )
         except Exception as e:
@@ -842,7 +829,7 @@ class LeanServer:
             def _handle_get_process(self):
                 # Reject while warmup is running. Otherwise these requests race
                 # warmup: available_processes is empty (gather only publishes at
-                # the end) and _num_used_processes is 0, so _get_or_create_process_async
+                # the end) and _num_used_processes is 0, so get_process_async
                 # spawns an extra REPL on top of the warmup N, piling onto an
                 # already saturated system.
                 if not server._warmup_complete:

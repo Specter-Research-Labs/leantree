@@ -56,7 +56,6 @@ class _FakePool:
         self._num_used_processes = 1  # a process has been "checked out"
         self._num_starting_processes = 0
         self._lock = None
-        self._process_available_event = None
         self.checkpoints: dict = {}
 
     @property
@@ -65,11 +64,11 @@ class _FakePool:
             self._lock = asyncio.Lock()
         return self._lock
 
-    @property
-    def process_available_event(self):
-        if self._process_available_event is None:
-            self._process_available_event = asyncio.Event()
-        return self._process_available_event
+    async def release_slot_async(self, process):
+        async with self.lock:
+            self.checkpoints.pop(process, None)
+            if self._num_used_processes > 0:
+                self._num_used_processes -= 1
 
     async def shutdown_async(self):
         return None
@@ -81,7 +80,6 @@ class _FakePool:
             if self._num_used_processes > 0:
                 self._num_used_processes -= 1
             self.available_processes.append(process)
-            self.process_available_event.set()
 
 
 class _FakeProcess:
