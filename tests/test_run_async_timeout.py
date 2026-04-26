@@ -29,6 +29,7 @@ import pytest
 from leantree.repl_adapter.server import (
     LeanServer,
     LeanClient,
+    LOOP_WATCHDOG_THRESHOLD,
     RUN_ASYNC_HEADROOM,
     DEFAULT_IS_VALID_SOURCE_TIMEOUT,
 )
@@ -164,6 +165,39 @@ def test_status_still_responds_while_loop_slow(running_server):
         assert resp.status == 200
     finally:
         conn.close()
+
+
+def test_loop_watchdog_logs_and_dumps_when_loop_stalls(running_server, caplog):
+    """The watchdog must log a 'Loop watchdog' error (and trigger
+    faulthandler.dump_traceback) when the loop is unresponsive for longer
+    than LOOP_WATCHDOG_THRESHOLD. Without this, a real production stall
+    leaves only the 40s aftermath log line - by which point SIGUSR1 sees an
+    idle process and the actual culprit's stack is gone."""
+    server, _port = running_server
+    caplog.set_level("ERROR", logger="LeanServer")
+    # Block well past the threshold so the watchdog has time to notice.
+    _block_loop(server, seconds=LOOP_WATCHDOG_THRESHOLD + 3.0)
+    # Watchdog probes every 1s; allow a generous margin for it to land.
+    deadline = time.monotonic() + LOOP_WATCHDOG_THRESHOLD + 8.0
+    while time.monotonic() < deadline:
+        if any("Loop watchdog" in r.message for r in caplog.records):
+            return
+        time.sleep(0.2)
+    pytest.fail(
+        f"watchdog did not log within {LOOP_WATCHDOG_THRESHOLD + 8.0:.0f}s; "
+        f"records={[r.message for r in caplog.records]}"
+    )
+
+
+def test_loop_watchdog_quiet_when_loop_healthy(running_server, caplog):
+    """Regression guard: a responsive loop must NOT trip the watchdog."""
+    server, _port = running_server
+    caplog.set_level("ERROR", logger="LeanServer")
+    # Sleep longer than the threshold so we'd catch a misfire, but don't
+    # block the loop - it should keep servicing watchdog probes.
+    time.sleep(LOOP_WATCHDOG_THRESHOLD + 2.0)
+    misfires = [r.message for r in caplog.records if "Loop watchdog" in r.message]
+    assert not misfires, f"watchdog misfired on healthy loop: {misfires}"
 
 
 if __name__ == "__main__":

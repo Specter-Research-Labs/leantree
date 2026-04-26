@@ -1,8 +1,10 @@
 import asyncio
 import concurrent.futures
 import contextlib
+import faulthandler
 import json
 import logging
+import sys
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -40,6 +42,17 @@ DEFAULT_COMMAND_TIMEOUT = 300.0  # matches _send_to_repl_async default
 DEFAULT_PROOF_FROM_SORRY_TIMEOUT = 300.0
 DEFAULT_IS_VALID_SOURCE_TIMEOUT = 60.0
 DEFAULT_TRY_APPLY_TACTIC_MS = 1000  # matches existing handler default
+
+# Loop watchdog. A background thread schedules a no-op callback on the event
+# loop every INTERVAL seconds; if the loop fails to run it within THRESHOLD,
+# we dump every thread's traceback to stderr and log an error. COOLDOWN keeps
+# a sustained stall from spamming dumps. Threshold is set well below the
+# RUN_ASYNC_HEADROOM-driven 40s `loop is unresponsive` line so the dump
+# captures the loop *while* it's stuck, not after the request handlers have
+# already given up and exited.
+LOOP_WATCHDOG_INTERVAL = 1.0
+LOOP_WATCHDOG_THRESHOLD = 5.0
+LOOP_WATCHDOG_COOLDOWN = 60.0
 
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
@@ -196,6 +209,10 @@ class LeanServer:
         # and returned to the pool automatically.
         self._process_lease_timeout = 600.0  # 10 minutes
         self._reaper_thread = None
+
+        # Event-loop watchdog: see _run_loop_watchdog and LOOP_WATCHDOG_*.
+        self._watchdog_thread = None
+        self._watchdog_stop = threading.Event()
 
     def _get_process_id(self, process: LeanProcess) -> int:
         """Get or create a process ID for a LeanProcess."""
@@ -463,6 +480,51 @@ class LeanServer:
                             process, reason=f"reaper return raised: {type(e).__name__}: {e}"
                         )
 
+    def _run_loop_watchdog(self):
+        """Detect event-loop stalls and dump all-thread tracebacks while stuck.
+
+        Catches the case where ``_run_async_op`` callers eventually log
+        ``loop is unresponsive`` after their 40s wait expires - by then the
+        stall is usually over and SIGUSR1 sees an idle process. This watchdog
+        captures the stack *during* the stall.
+        """
+        last_dump = 0.0
+        while not self._watchdog_stop.is_set():
+            loop = self._event_loop
+            if loop is None or loop.is_closed():
+                return
+            scheduled_at = time.monotonic()
+            ran = threading.Event()
+            try:
+                loop.call_soon_threadsafe(ran.set)
+            except RuntimeError:
+                return  # loop already closed
+            if not ran.wait(LOOP_WATCHDOG_THRESHOLD):
+                stall_so_far = time.monotonic() - scheduled_at
+                now = time.monotonic()
+                if now - last_dump >= LOOP_WATCHDOG_COOLDOWN:
+                    self.logger.error(
+                        f"Loop watchdog: probe scheduled but not run within "
+                        f"{stall_so_far:.1f}s (threshold {LOOP_WATCHDOG_THRESHOLD}s) - "
+                        f"dumping all-thread tracebacks to stderr"
+                    )
+                    try:
+                        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+                    except Exception as e:
+                        self.logger.error(f"Loop watchdog: faulthandler.dump_traceback failed: {e}")
+                    last_dump = now
+                # Wait (bounded) for the probe to actually run before sending
+                # another one, so we don't queue probes that all fire at once
+                # when the loop unblocks.
+                if not ran.wait(LOOP_WATCHDOG_COOLDOWN):
+                    self.logger.error(
+                        f"Loop watchdog: probe still not run after "
+                        f"{LOOP_WATCHDOG_THRESHOLD + LOOP_WATCHDOG_COOLDOWN:.0f}s; "
+                        f"continuing to poll"
+                    )
+            if self._watchdog_stop.wait(LOOP_WATCHDOG_INTERVAL):
+                return
+
     def start(self, warmup_coro=None):
         """Start the HTTP server.
 
@@ -487,6 +549,14 @@ class LeanServer:
         # Wait for event loop to be ready
         while self._event_loop is None:
             time.sleep(0.01)
+
+        # Start the loop watchdog as soon as the loop is up - it's most useful
+        # during warmup/heavy startup, when stalls are most likely.
+        self._watchdog_stop.clear()
+        self._watchdog_thread = threading.Thread(
+            target=self._run_loop_watchdog, daemon=True, name="LeanServer-loop-watchdog"
+        )
+        self._watchdog_thread.start()
 
         if warmup_coro is not None:
             self._warmup_complete = False
@@ -517,6 +587,13 @@ class LeanServer:
 
     def stop(self):
         """Stop the HTTP server and all Lean processes (both idle and checked-out)."""
+        # Stop the watchdog before tearing the loop down, so a probe scheduled
+        # mid-shutdown doesn't trip a false "loop stalled" dump.
+        self._watchdog_stop.set()
+        if self._watchdog_thread is not None:
+            self._watchdog_thread.join(timeout=LOOP_WATCHDOG_INTERVAL + 1.0)
+            self._watchdog_thread = None
+
         # First, stop checked-out processes that the pool doesn't track.
         # Must happen while the event loop is still running.
         if self._event_loop is not None:
