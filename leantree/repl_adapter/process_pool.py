@@ -280,8 +280,16 @@ class LeanProcessPool:
                 terminate_reason = "pool shutting down"
 
         if not should_terminate and self.pss_recycle_limit:
+            # Run PSS measurement off the loop thread. memory_usage_pss reads
+            # /proc/<pid>/smaps_rollup for the lake/repl/lean tree; for a
+            # multi-GiB Lean child with hundreds of mmapped olean segments
+            # this is 50-300 ms of synchronous syscalls. With many returns
+            # arriving in a burst (typical when N provers finish rollouts in
+            # waves), running this on the loop serialized the reads AND
+            # froze every other coroutine, surfacing as
+            # `get_process_async exceeded 40.0s on the event loop`.
             try:
-                measured_pss = process.memory_usage_pss()
+                measured_pss = await asyncio.to_thread(process.memory_usage_pss)
             except Exception as e:
                 self.logger.warning(
                     f"Error measuring process PSS on return: {e}. Terminating process as a precaution."
