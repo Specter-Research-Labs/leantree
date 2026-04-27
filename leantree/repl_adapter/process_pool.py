@@ -7,6 +7,17 @@ from leantree.repl_adapter.interaction import LeanProcess, LeanEnvironmentCheckp
 from leantree.utils import to_sync
 
 
+# Cap how long we'll wait for a single PSS measurement. memory_usage_pss reads
+# /proc/<pid>/smaps_rollup; on calm processes that's 50-300 ms, but when the
+# Lean child is CPU-saturated (pathological tactic, GC storm) the kernel walk
+# stretches to many seconds. Without a bound, the awaiting coroutine waits
+# forever and the to_thread worker stays wedged - on a thundering return-burst
+# the executor (default 32 workers) fills with stuck reads and no further
+# return path can complete. 5s is well above the calm-process p99 and short
+# enough that wedged-thread accumulation is bounded.
+PSS_MEASUREMENT_TIMEOUT = 5.0
+
+
 class LeanProcessPool:
     """
     A pool of LeanProcess instances for parallel processing.
@@ -274,7 +285,23 @@ class LeanProcessPool:
             # froze every other coroutine, surfacing as
             # `get_process_async exceeded 40.0s on the event loop`.
             try:
-                measured_pss = await asyncio.to_thread(process.memory_usage_pss)
+                measured_pss = await asyncio.wait_for(
+                    asyncio.to_thread(process.memory_usage_pss),
+                    timeout=PSS_MEASUREMENT_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                # The to_thread worker keeps running until the kernel finishes
+                # the smaps walk - we can't cancel it - but at least the awaiting
+                # coroutine is unblocked, so the return path can proceed and
+                # destroy this process. Treating an unmeasurable process as
+                # "recycle" is the right call: if PSS is taking >5s the process
+                # is likely pathological anyway.
+                self.logger.warning(
+                    f"PSS measurement did not complete in {PSS_MEASUREMENT_TIMEOUT}s. "
+                    f"Terminating process as a precaution."
+                )
+                should_terminate = True
+                terminate_reason = f"PSS measurement timed out (>{PSS_MEASUREMENT_TIMEOUT}s)"
             except Exception as e:
                 self.logger.warning(
                     f"Error measuring process PSS on return: {e}. Terminating process as a precaution."

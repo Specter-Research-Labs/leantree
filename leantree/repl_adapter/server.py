@@ -428,6 +428,15 @@ class LeanServer:
         ``self._processes``) but not touched for longer than
         ``_process_lease_timeout`` seconds AND there is no active HTTP request
         referencing it.
+
+        Reaped processes are destroyed outright (stop subprocess, release slot)
+        rather than recycled via ``return_process_async``. The recycle path
+        does a PSS read on /proc/<pid>/smaps_rollup off the loop thread; on a
+        CPU-saturated host that read can take many seconds and pile up wedged
+        executor workers, since the to_thread work isn't cancellable. For a
+        leaked process whose client is gone, there is no benefit to that
+        measurement - we're not deciding whether to keep it around. Skip the
+        return path entirely and go straight to teardown.
         """
         while True:
             time.sleep(60)
@@ -448,24 +457,9 @@ class LeanServer:
                 process = self._processes.remove(pid)
                 self._remove_branches_for_process(pid)
                 if process is not None:
-                    try:
-                        self._run_async(
-                            self.pool.return_process_async(process),
-                            timeout=RETURN_PROCESS_TIMEOUT,
-                        )
-                    except concurrent.futures.TimeoutError:
-                        self.logger.error(
-                            f"return_process_async for leaked process {pid} exceeded "
-                            f"{RETURN_PROCESS_TIMEOUT}s - destroying orphaned process"
-                        )
-                        self._destroy_untracked_process(
-                            process, reason=f"reaper return timed out for process_id={pid}"
-                        )
-                    except Exception as e:
-                        self.logger.error(f"Error returning leaked process {pid}: {e} - destroying orphaned process")
-                        self._destroy_untracked_process(
-                            process, reason=f"reaper return raised: {type(e).__name__}: {e}"
-                        )
+                    self._destroy_untracked_process(
+                        process, reason=f"reaper destroying leaked process_id={pid}"
+                    )
 
     def _run_loop_watchdog(self):
         """Detect event-loop stalls and dump all-thread tracebacks while stuck.
