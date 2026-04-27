@@ -11,14 +11,12 @@ from leantree.repl_adapter.interaction import LeanProcess, LeanEnvironmentCheckp
 from leantree.utils import to_sync
 
 
-# Cap how long we'll wait for a single PSS measurement. memory_usage_pss reads
-# /proc/<pid>/smaps_rollup; on calm processes that's 50-300 ms, but when the
-# Lean child is CPU-saturated (pathological tactic, GC storm) the kernel walk
-# stretches to many seconds. Without a bound, the awaiting coroutine waits
-# forever and the to_thread worker stays wedged - on a thundering return-burst
-# the executor (default 32 workers) fills with stuck reads and no further
-# return path can complete.
-PSS_MEASUREMENT_TIMEOUT = 5.0
+# Pace at which the memory governor reads PSS for one process. The full
+# sweep takes ``MEMORY_GOVERNOR_INTERVAL * len(_live)`` seconds; with the
+# default and a 128-process pool that's a ~64 s round-robin. PSS reads are
+# off the request hot path, so a slow individual read costs only the
+# governor's own latency to reach the next entry, never a client request.
+MEMORY_GOVERNOR_INTERVAL = 0.5
 
 # Bound on subprocess teardown. After SIGKILL the kernel should reap within
 # milliseconds, but NFS hangs / disk thrash have been seen to delay reaps.
@@ -59,6 +57,12 @@ class PoolEntry:
     exiting cleanly calls `pool.return_entry_async`, while an exception
     forces `pool.release(recycle=True)`. Direct use of `pool.acquire_async`
     + `pool.release` is also fine; release is idempotent.
+
+    ``over_budget`` is set by the memory governor when this entry's PSS
+    exceeds ``pool.pss_recycle_limit`` while the entry is checked_out. The
+    return path honours the flag by recycling instead of returning to idle.
+    Idle entries that cross the threshold are recycled inline by the
+    governor and never have their flag inspected again.
     """
     id: int
     pool: "LeanProcessPool"
@@ -67,6 +71,7 @@ class PoolEntry:
     state: PoolEntryState
     checkpoint: LeanEnvironmentCheckpoint | None = None
     last_used: float = 0.0
+    over_budget: bool = False
 
     async def __aenter__(self) -> Self:
         return self
@@ -172,6 +177,7 @@ class LeanProcessPool:
         self._workers_stop = threading.Event()
         self._idle_reaper_thread: threading.Thread | None = None
         self._liveness_thread: threading.Thread | None = None
+        self._memory_governor_thread: threading.Thread | None = None
 
         # External hook the server installs so the idle reaper can avoid
         # reclaiming entries whose HTTP request is still in flight (e.g. a
@@ -244,6 +250,17 @@ class LeanProcessPool:
             daemon=True,
         )
         self._liveness_thread.start()
+
+        # Memory governor: only meaningful when a recycle limit is set.
+        # With pss_recycle_limit=None (tests, standalone scripts) the
+        # governor would have nothing to do, so don't start the thread.
+        if self.pss_recycle_limit:
+            self._memory_governor_thread = threading.Thread(
+                target=self._memory_governor_loop,
+                name="LeanPool-memory-governor",
+                daemon=True,
+            )
+            self._memory_governor_thread.start()
 
     def shutdown(self) -> None:
         """Stop all processes and join workers. Blocks until the janitor
@@ -356,7 +373,11 @@ class LeanProcessPool:
         return entries_to_stop
 
     def _join_worker_threads(self) -> None:
-        for thread in (self._idle_reaper_thread, self._liveness_thread):
+        for thread in (
+            self._idle_reaper_thread,
+            self._liveness_thread,
+            self._memory_governor_thread,
+        ):
             if thread is not None:
                 thread.join(timeout=2.0)
 
@@ -474,52 +495,33 @@ class LeanProcessPool:
                 self._capacity_changed.notify()
 
     async def return_entry_async(self, entry: PoolEntry) -> None:
-        """Client-driven return path. Measures PSS (bounded), drains REPL
-        output, rolls back to checkpoint, and releases the entry to idle -
-        OR recycles if PSS exceeds the threshold or the measurement hangs.
+        """Client-driven return path. Drains REPL output, rolls back to
+        checkpoint, and releases the entry to idle - OR recycles if the
+        memory governor has flagged it as over budget.
+
+        Memory-budget enforcement does NOT live here. The governor
+        (`_memory_governor_loop`) measures PSS in the background and sets
+        ``entry.over_budget`` for any process whose footprint crosses
+        ``pss_recycle_limit``. Putting the read here used to form a
+        thundering-herd hazard at job boundaries: 100+ simultaneous
+        returns each issued an ``asyncio.to_thread`` PSS measurement,
+        saturating the default 32-worker executor and timing out unrelated
+        ``acquire_async`` calls (observed: second eval after a long
+        collect cycle, all 88 acquires hit the 40 s outer ceiling).
 
         This is the only path that ever ends in ``release(recycle=False)``.
         Every brutal-recycle source (deadline watchdog, idle reaper,
-        liveness reconciler, poisoned process from ``LeanProcessException``)
-        goes through ``release(recycle=True)`` directly and skips PSS - PSS
-        is meaningless once the recycle decision is made and the read can
-        wedge against a CPU-saturated REPL (commit f49398d).
+        liveness reconciler, governor for over-budget idle entries,
+        poisoned process from ``LeanProcessException``) goes through
+        ``release(recycle=True)`` directly.
         """
         if entry.process is None:
             self.release(entry, recycle=True, reason="return of un-spawned placeholder")
             return
 
-        if self.pss_recycle_limit:
-            try:
-                pss = await asyncio.wait_for(
-                    asyncio.to_thread(entry.process.memory_usage_pss),
-                    timeout=PSS_MEASUREMENT_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                self.release(
-                    entry,
-                    recycle=True,
-                    reason=f"PSS measurement timed out (>{PSS_MEASUREMENT_TIMEOUT}s)",
-                )
-                return
-            except Exception as e:
-                self.release(
-                    entry,
-                    recycle=True,
-                    reason=f"PSS measurement raised {type(e).__name__}: {e}",
-                )
-                return
-            if pss > self.pss_recycle_limit:
-                mib = 1024 * 1024
-                self.release(
-                    entry,
-                    recycle=True,
-                    reason=(
-                        f"PSS={pss / mib:.1f} MiB > "
-                        f"recycle limit {self.pss_recycle_limit / mib:.1f} MiB"
-                    ),
-                )
-                return
+        if entry.over_budget:
+            self.release(entry, recycle=True, reason="over PSS budget (governor flagged)")
+            return
 
         try:
             await entry.process.drain_repl_output_async()
@@ -800,6 +802,118 @@ class LeanProcessPool:
                     self.release(
                         entry, recycle=True, reason="subprocess pid recycled"
                     )
+
+    def _memory_governor_loop(self) -> None:
+        """Background memory-budget enforcement.
+
+        Round-robin walks ``_live`` one entry per
+        ``MEMORY_GOVERNOR_INTERVAL``, reads the entry's PSS, and acts:
+
+        - PSS at or below ``pss_recycle_limit``: do nothing.
+        - PSS over the limit, entry idle: recycle inline.
+        - PSS over the limit, entry checked_out: set ``over_budget=True``.
+          ``return_entry_async`` honours the flag the next time the actor
+          gives the process back.
+
+        The PSS read happens *outside* the pool lock so a slow
+        ``smaps_rollup`` walk can't stall acquire/release. The lock is
+        only re-taken to read state and either flag or recycle, both of
+        which are ~microseconds.
+
+        This thread replaces the per-return PSS check that used to live
+        in ``return_entry_async``. Putting the read on the request hot
+        path turned every job-boundary return wave into an
+        ``asyncio.to_thread`` storm; here it's a constant-rate background
+        sweep that no client request waits on.
+        """
+        cursor = 0
+        mib = 1024 * 1024
+        while not self._workers_stop.wait(MEMORY_GOVERNOR_INTERVAL):
+            if self.pss_recycle_limit is None:
+                # Pool was reconfigured to disable PSS recycling; nothing
+                # to do, but keep the thread alive (it's daemon and
+                # joined at shutdown).
+                continue
+            with self._lock:
+                entries = list(self._live.values())
+            if not entries:
+                cursor = 0
+                continue
+            cursor %= len(entries)
+            entry = entries[cursor]
+            cursor += 1
+
+            with self._lock:
+                if entry.id not in self._live:
+                    continue
+                if entry.state in ("starting", "stopping"):
+                    continue
+                state = entry.state
+                flagged = entry.over_budget
+                process = entry.process
+
+            if flagged:
+                # Already known over budget. If still checked_out, wait
+                # for the actor's return; if idle, recycle now (rare
+                # race: flag was set between drain and release(idle) in
+                # the return path, so the return didn't honour it).
+                if state == "idle":
+                    self.release(
+                        entry,
+                        recycle=True,
+                        reason="over PSS budget (idle, governor cleanup)",
+                    )
+                continue
+
+            if process is None:
+                continue
+
+            try:
+                pss = process.memory_usage_pss()
+            except Exception as e:
+                # Subprocess may have just died; let the liveness
+                # reconciler handle it. Don't recycle here based on a
+                # read failure - that would race with the normal
+                # in-flight-tactic exception path.
+                self.logger.debug(
+                    f"memory governor: PSS read failed for entry {entry.id}: "
+                    f"{type(e).__name__}: {e}"
+                )
+                continue
+
+            if pss <= self.pss_recycle_limit:
+                continue
+
+            # Over budget. Decide based on current state under the lock so
+            # we don't race acquire/return.
+            with self._capacity_changed:
+                if entry.id not in self._live:
+                    continue
+                state = entry.state
+                if state == "checked_out":
+                    entry.over_budget = True
+                    self.logger.info(
+                        f"memory governor: flagging entry {entry.id} "
+                        f"(pid={entry.pid}) over budget "
+                        f"(PSS={pss / mib:.1f} MiB > "
+                        f"{self.pss_recycle_limit / mib:.1f} MiB); "
+                        f"will recycle on return"
+                    )
+                    continue
+                if state != "idle":
+                    continue
+            # Idle and over budget: recycle now. ``release`` re-takes the
+            # lock and is idempotent; calling it outside the with-block
+            # avoids holding the lock across the janitor handoff.
+            self.release(
+                entry,
+                recycle=True,
+                reason=(
+                    f"PSS={pss / mib:.1f} MiB > "
+                    f"recycle limit {self.pss_recycle_limit / mib:.1f} MiB "
+                    f"(governor)"
+                ),
+            )
 
     # ------------------------------------------------------------------
     # Sync wrappers (for non-async callers, mainly tests)
