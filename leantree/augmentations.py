@@ -92,30 +92,35 @@ def _generate_random_name(length: int, avoid_names: set[str], rng=random) -> str
 def _replace_name(text: str, old_name: str, new_name: str) -> str:
     """Replace every whole-identifier occurrence of `old_name` in `text` with `new_name`.
 
-    Matches are bounded by non-identifier characters on both sides. `.` is treated as
-    identifier-like so that qualified names like `Foo.bar` are not partially matched.
+    The boundary check is asymmetric on `.`: a leading `.` blocks the match (so
+    `bar` in `Foo.bar` is left alone, since it is part of a qualified name), but a
+    trailing `.` does not (so `h` in `h.le` is renamed, since `.le` is a projection
+    on the local `h`, not a namespace lookup).
     """
-    def is_identifier_like(c):
+    def is_id_leading(c):
         return c.isalnum() or c == "_" or c == "'" or c == "."
+
+    def is_id_trailing(c):
+        return c.isalnum() or c == "_" or c == "'"
 
     result = []
     i = 0
     n = len(text)
     m = len(old_name)
-    
+
     while i < n:
         if text[i:i+m] == old_name:
-            is_start_ok = (i == 0) or not is_identifier_like(text[i-1])
-            is_end_ok = (i + m >= n) or not is_identifier_like(text[i+m])
-            
+            is_start_ok = (i == 0) or not is_id_leading(text[i-1])
+            is_end_ok = (i + m >= n) or not is_id_trailing(text[i+m])
+
             if is_start_ok and is_end_ok:
                 result.append(new_name)
                 i += m
                 continue
-        
+
         result.append(text[i])
         i += 1
-        
+
     return "".join(result)
 
 

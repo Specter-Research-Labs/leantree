@@ -216,6 +216,15 @@ def test_replace_name_boundaries():
     new_text5 = _replace_name(text5, "bar", "qux")
     assert new_text5 == "Foo.bar.baz"
 
+    # Projection / dot-notation on a hypothesis: a trailing `.` must not block
+    # the rename (regression: previously left `h₀` untouched in `h₀.le`, which
+    # corrupted (state, tactic) pairs in RL training).
+    text6 = "linarith [h₀.le, h₁.le]"
+    new_text6 = _replace_name(text6, "h₀", "Cy")
+    assert new_text6 == "linarith [Cy.le, h₁.le]"
+    new_text6b = _replace_name(new_text6, "h₁", "Xn")
+    assert new_text6b == "linarith [Cy.le, Xn.le]"
+
 
 def test_rename_variables_no_dagger_collision():
     # If `h✝` already exists, renaming another hypothesis must never produce `h✝` again.
