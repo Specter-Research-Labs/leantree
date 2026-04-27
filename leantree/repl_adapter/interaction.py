@@ -42,6 +42,15 @@ def _make_subprocess_preexec_fn(max_memory_bytes: int | None):
       Python process (observed in production).
     - ``prctl(PR_SET_PDEATHSIG, SIGKILL)``: when the parent process exits for any reason (including SIGKILL by the OOM killer), the kernel
       immediately sends SIGKILL to this child.  Eliminates orphaned lake/repl-processes.
+    - ``setsid()``: put the child (and everything it forks: lake -> repl ->
+      lean threads) into a fresh process group whose PGID equals this child's
+      PID.  Without this, ``self._proc.kill()`` only SIGKILLs the immediate
+      ``lake`` child; its ``repl`` grandchild survives, gets reparented to
+      init, and keeps grinding on the last tactic forever.  Observed in
+      production: a single orphaned repl with 101 threads burning ~5000% CPU
+      and 60+ hours of cumulative CPU time after the lake parent died.  With
+      setsid in place, ``os.killpg(proc.pid, SIGKILL)`` reaches every
+      descendant in one syscall.
     """
     libc_path = ctypes.util.find_library("c") or "libc.so.6"
     try:
@@ -85,8 +94,50 @@ def _make_subprocess_preexec_fn(max_memory_bytes: int | None):
                     )
             except (AttributeError, OSError) as e:
                 _warn(f"prctl(PR_SET_PDEATHSIG, SIGKILL) failed: {e!r}")
+        # New session + new process group with this child as leader; PGID
+        # equals our PID after this call.  Forked descendants (repl, lean
+        # threads) inherit the PGID, so a later os.killpg(pid, SIGKILL)
+        # reaps the whole tree atomically.
+        try:
+            os.setsid()
+        except OSError as e:
+            _warn(f"setsid() failed: {e!r}")
 
     return _preexec
+
+
+def _kill_process_group(proc, logger: logging.Logger) -> None:
+    """SIGKILL every process in ``proc``'s process group.
+
+    Relies on ``_preexec`` having called ``setsid()`` so that ``proc.pid`` is
+    also the PGID.  ``proc.kill()`` alone would only signal the immediate
+    child (``lake``) and leave its ``repl`` grandchild orphaned and spinning;
+    ``killpg`` reaches every descendant in one syscall.
+
+    Never raises: callers (e.g. ``stop_async``) need their cleanup to
+    continue regardless of what the kill returned.  Outcomes are logged so
+    nothing is silent:
+    - ``ProcessLookupError`` -> warning.  Expected when the kernel
+      SIGKILL'd the group via RLIMIT_AS before our kill ran, but worth
+      surfacing because if it happens routinely our tactic timeouts are
+      losing races to the memory ceiling.
+    - Anything else (e.g. ``PermissionError`` from setsid not having run)
+      -> error.  Indicates the killpg-based teardown is broken and
+      grandchildren are about to leak.
+    """
+    pid = proc.pid
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        logger.warning(
+            f"_kill_process_group: pgid={pid} already gone "
+            f"(process exited before our kill ran)"
+        )
+    except Exception as e:
+        logger.error(
+            f"_kill_process_group: killpg(pgid={pid}, SIGKILL) failed - "
+            f"descendants may be orphaned: {type(e).__name__}: {e}"
+        )
 
 
 # TODO!: maybe not all sorries are reported: see https://github.com/leanprover-community/repl/issues/4
@@ -314,10 +365,7 @@ class LeanProcess:
     async def stop_async(self):
         """Stop the Lean REPL asynchronously."""
         assert self._proc is not None
-        try:
-            self._proc.kill()
-        except ProcessLookupError:
-            pass
+        _kill_process_group(self._proc, self.logger)
         # See https://github.com/python/cpython/issues/119710#issuecomment-2425168469
         # and https://github.com/python/cpython/issues/88050
         # on why this line is necessary (otherwise the wait() call hangs).
@@ -438,10 +486,7 @@ class LeanProcess:
         def _on_timeout():
             nonlocal timed_out
             timed_out = True
-            try:
-                self._proc.kill()
-            except (ProcessLookupError, AttributeError):
-                pass
+            _kill_process_group(self._proc, self.logger)
 
         async def _read_response():
             while True:
@@ -760,7 +805,7 @@ class LeanProcess:
         finally:
             # Wait for the subprocess to exit
             if self._proc.returncode is None:
-                self._proc.kill()
+                _kill_process_group(self._proc, self.logger)
             await self._proc.wait()
             # Cancel the reading tasks
             stdout_task.cancel()
