@@ -70,68 +70,73 @@ def _restore_terminal():
 atexit.register(_restore_terminal)
 
 
+def _print_status(client: LeanClient):
+    """Fetch and print server status. Used by both the Enter-key monitor and SIGUSR2."""
+    try:
+        status = client.check_status()
+        print(f"\n=== Server Status ===")
+        # ``used`` is processes held by actors right now; the
+        # rest are pool states.  ``stopping`` is the janitor
+        # backlog - persistently >0 means subprocess teardown
+        # is wedged.
+        print(
+            f"Pool: {status['used_processes']} used, "
+            f"{status['available_processes']} available, "
+            f"{status['starting_processes']} starting, "
+            f"{status['stopping_processes']} stopping  "
+            f"({status['total_processes']}/{status['max_processes']} alive)"
+        )
+        print(f"RAM: {status['ram']['percent']:.1f}% used "
+              f"({status['ram']['used_bytes'] / (1024**3):.1f}GB / "
+              f"{status['ram']['total_bytes'] / (1024**3):.1f}GB)")
+        avg_cpu = sum(status['cpu_percent_per_core']) / len(status['cpu_percent_per_core'])
+        print(f"CPU: {avg_cpu:.1f}% average across {len(status['cpu_percent_per_core'])} cores")
+
+        idle_too_long = status.get('idle_too_long_60s', 0)
+        inactive_br = status.get('inactive_branches_60s', 0)
+        total_br = status.get('total_branches', 0)
+        print(
+            f"Idle >60s: {idle_too_long}/{status['total_processes']} pool entries, "
+            f"{inactive_br}/{total_br} branches"
+        )
+
+        # Per-process memory. Snapshot pool.checkpoints.keys() so we don't iterate
+        # a dict being mutated by the event loop. Skip processes that fail to report
+        # (may be mid-shutdown) and keep RSS/PSS aligned by appending together.
+        # rss_values: list[float] = []
+        # pss_values: list[float] = []
+        # for process in list(pool.checkpoints.keys()):
+        #     try:
+        #         rss = process.memory_usage_rss()
+        #         pss = process.memory_usage_pss()
+        #     except Exception:
+        #         continue
+        #     rss_values.append(rss / (1024**3))
+        #     pss_values.append(pss / (1024**3))
+        # sorted_pairs = sorted(zip(rss_values, pss_values), key=lambda p: p[0], reverse=True)
+        # print(f"PSS (GB): {' '.join(f'{p:.2f}' for _, p in sorted_pairs)}")
+        # print(f"RSS (GB): {' '.join(f'{r:.2f}' for r, _ in sorted_pairs)}")
+
+        # Show active requests
+        active_requests = status.get('active_requests', [])
+        if active_requests:
+            print(f"Active requests ({len(active_requests)}):")
+            for req in active_requests:
+                print(f"  - {req['path']} ({req['duration_seconds']}s, thread: {req['thread']})")
+        else:
+            print("Active requests: none")
+        print()
+    except Exception as e:
+        print(f"Error getting status: {e}")
+
+
 def keyboard_monitor(address: str, port: int, pool: LeanProcessPool):
-    """Print server status (and per-process RSS/PSS) each time the user hits Enter."""
+    """Print server status each time the user hits Enter."""
     client = LeanClient(address, port)
     while True:
         try:
             input()  # Wait for Enter key
-            try:
-                status = client.check_status()
-                print(f"\n=== Server Status ===")
-                # ``used`` is processes held by actors right now; the
-                # rest are pool states.  ``stopping`` is the janitor
-                # backlog - persistently >0 means subprocess teardown
-                # is wedged.
-                print(
-                    f"Pool: {status['used_processes']} used, "
-                    f"{status['available_processes']} available, "
-                    f"{status['starting_processes']} starting, "
-                    f"{status['stopping_processes']} stopping  "
-                    f"({status['total_processes']}/{status['max_processes']} alive)"
-                )
-                print(f"RAM: {status['ram']['percent']:.1f}% used "
-                      f"({status['ram']['used_bytes'] / (1024**3):.1f}GB / "
-                      f"{status['ram']['total_bytes'] / (1024**3):.1f}GB)")
-                avg_cpu = sum(status['cpu_percent_per_core']) / len(status['cpu_percent_per_core'])
-                print(f"CPU: {avg_cpu:.1f}% average across {len(status['cpu_percent_per_core'])} cores")
-
-                idle_too_long = status.get('idle_too_long_60s', 0)
-                inactive_br = status.get('inactive_branches_60s', 0)
-                total_br = status.get('total_branches', 0)
-                print(
-                    f"Idle >60s: {idle_too_long}/{status['total_processes']} pool entries, "
-                    f"{inactive_br}/{total_br} branches"
-                )
-
-                # Per-process memory. Snapshot pool.checkpoints.keys() so we don't iterate
-                # a dict being mutated by the event loop. Skip processes that fail to report
-                # (may be mid-shutdown) and keep RSS/PSS aligned by appending together.
-                # rss_values: list[float] = []
-                # pss_values: list[float] = []
-                # for process in list(pool.checkpoints.keys()):
-                #     try:
-                #         rss = process.memory_usage_rss()
-                #         pss = process.memory_usage_pss()
-                #     except Exception:
-                #         continue
-                #     rss_values.append(rss / (1024**3))
-                #     pss_values.append(pss / (1024**3))
-                # sorted_pairs = sorted(zip(rss_values, pss_values), key=lambda p: p[0], reverse=True)
-                # print(f"PSS (GB): {' '.join(f'{p:.2f}' for _, p in sorted_pairs)}")
-                # print(f"RSS (GB): {' '.join(f'{r:.2f}' for r, _ in sorted_pairs)}")
-
-                # Show active requests
-                active_requests = status.get('active_requests', [])
-                if active_requests:
-                    print(f"Active requests ({len(active_requests)}):")
-                    for req in active_requests:
-                        print(f"  - {req['path']} ({req['duration_seconds']}s, thread: {req['thread']})")
-                else:
-                    print("Active requests: none")
-                print()
-            except Exception as e:
-                print(f"Error getting status: {e}")
+            _print_status(client)
         except EOFError:
             # stdin closed, exit the thread
             break
@@ -232,6 +237,21 @@ def main():
         logger.debug("Registered SIGUSR1 handler: kill -USR1 <pid> dumps all-thread tracebacks to stderr")
     except (AttributeError, ValueError, OSError) as e:
         logger.error(f"Could not register SIGUSR1 faulthandler: {e}")
+
+    # Make `kill -USR2 <pid>` print server status (same output as pressing Enter).
+    # The handler dispatches to a thread because check_status() does HTTP I/O,
+    # which is unsafe to run inside a signal handler.
+    def _usr2_print_status(sig, frame):
+        threading.Thread(
+            target=_print_status,
+            args=(LeanClient(args.address, args.port),),
+            daemon=True,
+        ).start()
+    try:
+        signal.signal(signal.SIGUSR2, _usr2_print_status)
+        logger.debug("Registered SIGUSR2 handler: kill -USR2 <pid> prints server status")
+    except (AttributeError, ValueError, OSError) as e:
+        logger.error(f"Could not register SIGUSR2 handler: {e}")
 
     # Determine repl_exe path
     if args.repl_exe:
