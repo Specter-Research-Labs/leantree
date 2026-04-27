@@ -193,7 +193,7 @@ class LeanProcess:
         # Python versions tie the lock to the running event loop.
         self._io_lock = None
 
-    def _describe_ended_process(self) -> str:
+    async def _describe_ended_process(self) -> str:
         """Human-readable explanation of why the REPL subprocess ended.
 
         Used when we observe EOF on stdout - the precise cause is the single
@@ -210,10 +210,16 @@ class LeanProcess:
 
         # Lean prints `INTERNAL PANIC: out of memory` on allocation failure
         # and then exits; the exit code we race to observe is just noise in
-        # that case. Surface the real cause directly.
+        # that case. Surface the real cause directly. `cannot allocate memory`
+        # catches libgmp's `GNU MP: Cannot allocate memory` abort path, which
+        # bypasses Lean's own panic message.
         for line in stderr_tail:
             low = line.lower()
-            if "out of memory" in low or "std::bad_alloc" in low:
+            if (
+                "out of memory" in low
+                or "std::bad_alloc" in low
+                or "cannot allocate memory" in low
+            ):
                 return (
                     "Lean REPL ran out of memory (INTERNAL PANIC) - tactic "
                     "allocation exceeded available memory; reduce tactic "
@@ -226,7 +232,18 @@ class LeanProcess:
                     "macro); subprocess aborted"
                 )
 
+        # stdout EOF beats wait() to the punch fairly often: the kernel
+        # closes the pipe FDs as part of teardown, but `returncode` only
+        # gets set once asyncio has reaped the child. Give wait() a brief
+        # window to resolve so we can report the real exit code/signal
+        # instead of the "still running" race tag.
         rc = getattr(self._proc, "returncode", None)
+        if rc is None:
+            try:
+                await asyncio.wait_for(self._proc.wait(), timeout=0.5)
+            except (asyncio.TimeoutError, AttributeError):
+                pass
+            rc = getattr(self._proc, "returncode", None)
         if rc is None:
             exit_desc = "still running (race: stdout closed before wait() saw the exit)"
         elif rc >= 0:
@@ -440,7 +457,7 @@ class LeanProcess:
                     # If we're the ones who just killed the process via the
                     # deadline watchdog, the outer code tags the error with
                     # the timeout reason, so don't over-log here.
-                    raise LeanProcessException(self._describe_ended_process())
+                    raise LeanProcessException(await self._describe_ended_process())
                 decoded_line = line.decode('utf-8')
                 if decoded_line.strip() == "":
                     break
