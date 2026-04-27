@@ -7,11 +7,14 @@ import os
 import re
 import resource
 import signal
+import threading
+import time
+import weakref
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Self, Any, AsyncIterator
+from typing import Self, AsyncIterator
 
 import psutil
 
@@ -140,6 +143,82 @@ def _kill_process_group(proc, logger: logging.Logger) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Module-level deadline watchdog
+# ---------------------------------------------------------------------------
+# A single daemon thread polls every live ``LeanProcess`` instance and
+# SIGKILLs the REPL process group of any whose tactic deadline has expired.
+# Independent of any asyncio loop or request coroutine, so a coroutine
+# cancelled mid-await still gets the kill - the cancellation race that
+# previously left runaway tactics is impossible by construction.
+#
+# Why module-level (not per-process or per-pool):
+# - Per-process thread = N threads for N processes; trivially wasteful at
+#   N=64.
+# - Per-pool thread = bare LeanProcess instances (project.py, tests) get
+#   no protection.
+# - One module-level thread, started lazily on first LeanProcess creation,
+#   gives uniform coverage at a fixed cost.
+
+_DEADLINE_WATCHDOG_INTERVAL = 0.25  # seconds
+
+_live_processes: "weakref.WeakSet[LeanProcess]" = weakref.WeakSet()
+_watchdog_lock = threading.Lock()
+_watchdog_thread: threading.Thread | None = None
+_watchdog_logger = logging.getLogger(__name__ + ".watchdog")
+
+
+def _ensure_watchdog_started() -> None:
+    """Start the module-level deadline watchdog thread if it isn't running.
+    Called from ``LeanProcess.__init__``; the thread is daemon and lives
+    for the rest of the Python process's lifetime."""
+    global _watchdog_thread
+    with _watchdog_lock:
+        if _watchdog_thread is not None:
+            return
+        _watchdog_thread = threading.Thread(
+            target=_deadline_watchdog_loop,
+            name="LeanProcess-deadline-watchdog",
+            daemon=True,
+        )
+        _watchdog_thread.start()
+
+
+def _deadline_watchdog_loop() -> None:
+    while True:
+        time.sleep(_DEADLINE_WATCHDOG_INTERVAL)
+        now = time.monotonic()
+        try:
+            procs = list(_live_processes)
+        except RuntimeError:
+            # WeakSet mutated during iteration (GC of a dead LeanProcess).
+            # Skip this tick; we'll catch any expiries on the next one.
+            continue
+        for proc in procs:
+            d = proc._deadline_until
+            if d is None:
+                continue
+            deadline, gen = d
+            if now <= deadline:
+                continue
+            # Recheck right before kill - if the deadline was cleared in
+            # the window between our scan and now (the read returned and
+            # the coroutine ran its `finally`), generation/value will
+            # differ and we suppress the kill.  Without this guard a
+            # late-firing watchdog would land on a process that's about
+            # to serve the next request.
+            cur = proc._deadline_until
+            if cur is None or cur != (deadline, gen):
+                continue
+            try:
+                proc.kill_group()
+            except Exception as e:
+                _watchdog_logger.error(
+                    f"deadline watchdog kill_group raised "
+                    f"{type(e).__name__}: {e}"
+                )
+
+
 # TODO!: maybe not all sorries are reported: see https://github.com/leanprover-community/repl/issues/4
 #  E.g. in: `simpa using sorry`, the sorry is not detected
 
@@ -221,13 +300,11 @@ class LeanProcess:
         repl_exe: Path,
         project_path: Path,
         logger: logging.Logger | None = None,
-        pool: Any = None,
         rss_hard_limit: int | None = None,
     ):
         self.repl_exe = repl_exe
         self.project_path = project_path
         self.logger = logger if logger else logging.getLogger(__name__)
-        self.pool = pool
         # Hard per-subprocess address-space ceiling enforced via RLIMIT_AS in
         # ``start_async``'s preexec_fn.  ``None`` disables the limit.
         self.rss_hard_limit = rss_hard_limit
@@ -243,6 +320,22 @@ class LeanProcess:
         # already waiting for incoming data`).  Created lazily because some
         # Python versions tie the lock to the running event loop.
         self._io_lock = None
+        # Per-process tactic deadline.  ``None`` while no tactic is in
+        # flight; ``(monotonic_deadline, generation)`` while one is.  Read
+        # by the module-level deadline-watchdog thread, which fires
+        # ``kill_group()`` on expiry independent of any request coroutine.
+        # Generation-tagged so a watchdog firing in the window between read
+        # success and ``finally``'s clear doesn't kill a process about to
+        # serve the next request.  See ``_send_to_repl_async`` for arming.
+        self._deadline_until: tuple[float, int] | None = None
+        self._deadline_generation: int = 0
+
+        # Register with the module-level watchdog.  The WeakSet entry is
+        # auto-removed when this LeanProcess is GC'd, so no cleanup hook
+        # is needed.  ``_ensure_watchdog_started`` is a no-op after the
+        # first call.
+        _live_processes.add(self)
+        _ensure_watchdog_started()
 
     async def _describe_ended_process(self) -> str:
         """Human-readable explanation of why the REPL subprocess ended.
@@ -420,11 +513,7 @@ class LeanProcess:
         return self
 
     async def __aexit__(self, *args, **kwargs):
-        if self.pool:
-            # If this is a managed process, return it to the pool instead of terminating.
-            await self.pool.return_process_async(self)
-        else:
-            await self.stop_async()
+        await self.stop_async()
 
     def __enter__(self) -> Self:
         """Synchronous context manager entry."""
@@ -434,17 +523,46 @@ class LeanProcess:
 
     def __exit__(self, *args, **kwargs):
         """Synchronous context manager exit."""
-        if self.pool:
-            # If this is a managed process, return it to the pool instead of terminating.
-            self.pool.return_process(self)
-        else:
-            self.stop()
+        self.stop()
 
     def checkpoint(self) -> LeanEnvironmentCheckpoint:
         return LeanEnvironmentCheckpoint(self._env_id)
 
     def rollback_to(self, checkpoint: LeanEnvironmentCheckpoint):
         self._env_id = checkpoint.env_id
+
+    def set_deadline(self, seconds: float | None) -> None:
+        """Arm or clear the per-process tactic deadline.  Read by the
+        module-level deadline-watchdog thread, which fires ``kill_group()``
+        on expiry independently of the awaiting coroutine.
+
+        The generation counter advances on every call so the watchdog can
+        recheck immediately before kill: if the value it sampled doesn't
+        match the current value, the deadline was cleared (the read
+        returned cleanly) and the kill is suppressed.
+
+        ``seconds=None`` clears the deadline.  Idempotent.
+        """
+        # Plain attribute write under the GIL is atomic; no lock needed.
+        # The generation counter ensures the watchdog can detect a stale
+        # sample without coordination.
+        self._deadline_generation += 1
+        if seconds is None:
+            self._deadline_until = None
+        else:
+            self._deadline_until = (time.monotonic() + seconds, self._deadline_generation)
+
+    def kill_group(self) -> None:
+        """SIGKILL the entire REPL process group via ``killpg``.  Wraps
+        ``_kill_process_group`` so external callers (the pool watchdog)
+        don't need to import a private module helper.  Relies on
+        ``setsid()`` in the preexec_fn (commit e2a7390); without setsid
+        this would only signal the immediate ``lake`` child and the
+        ``repl`` grandchild would survive as a runaway orphan.
+        Idempotent and never raises.
+        """
+        if self._proc is not None:
+            _kill_process_group(self._proc, self.logger)
 
     async def _send_to_repl_async(self, data: dict, timeout: float | None = 300) -> dict:
         """Send data to the REPL asynchronously and return the response.
@@ -465,11 +583,16 @@ class LeanProcess:
         a leanserver request handler it deadlocks the asyncio event loop,
         and the whole leanserver eventually stops answering HTTP.
 
-        Killing the subprocess on deadline avoids the race entirely:
-        ``readline()`` cleanly returns ``b""`` (EOF), the inner loop
-        below converts that to a ``LeanProcessException``, and we re-tag
-        it with the timeout message.  The poisoned process is then torn
-        down by the pool's existing logic.
+        Kill-on-deadline runs in the module-level watchdog thread, NOT in
+        a per-call ``loop.call_later``.  The old per-call timer was armed
+        and cancelled inside this coroutine, so a coroutine cancelled
+        before its ``await`` resumed (CancelledError, request hangup,
+        outer ``_run_async_op`` timing out) cancelled the timer in
+        ``finally`` and left the REPL grinding with no watchdog.  The
+        thread-based watchdog is independent of this coroutine's
+        lifetime.  ``readline()`` sees EOF when the watchdog kills, the
+        inner loop converts that to ``LeanProcessException``, and the
+        post-read deadline check below re-tags it as a timeout.
         """
         self._assert_started()
         serialized = json.dumps(data, ensure_ascii=False) + "\n\n"
@@ -480,13 +603,9 @@ class LeanProcess:
             self._io_lock = asyncio.Lock()
 
         response_lines = []
-        timed_out = False
-        timeout_handle = None
-
-        def _on_timeout():
-            nonlocal timed_out
-            timed_out = True
-            _kill_process_group(self._proc, self.logger)
+        deadline_at: float | None = (
+            time.monotonic() + timeout if timeout is not None else None
+        )
 
         async def _read_response():
             while True:
@@ -499,9 +618,8 @@ class LeanProcess:
                     #     kernel OOM killer, or our own kill-on-deadline.
                     #   - returncode == -11 (SIGSEGV): Lean segfault.
                     #   - returncode > 0: Lean exited on its own.
-                    # If we're the ones who just killed the process via the
-                    # deadline watchdog, the outer code tags the error with
-                    # the timeout reason, so don't over-log here.
+                    # The post-read deadline check tags the timeout case
+                    # specifically; this path covers all the others.
                     raise LeanProcessException(await self._describe_ended_process())
                 decoded_line = line.decode('utf-8')
                 if decoded_line.strip() == "":
@@ -513,22 +631,13 @@ class LeanProcess:
                 self._proc.stdin.write(serialized.encode('utf-8'))
                 await self._proc.stdin.drain()
 
-                if timeout is not None:
-                    timeout_handle = asyncio.get_event_loop().call_later(timeout, _on_timeout)
+                self.set_deadline(timeout)
                 try:
                     await _read_response()
                 finally:
-                    if timeout_handle is not None:
-                        timeout_handle.cancel()
-                if timed_out:
-                    # Race: read returned cleanly but the watchdog had already
-                    # fired and killed the process.  Surface the timeout, the
-                    # response we just read is from a soon-to-be-dead process.
-                    raise LeanProcessException(
-                        f"Lean REPL did not respond within {timeout}s"
-                    )
+                    self.set_deadline(None)
             except LeanProcessException:
-                if timed_out:
+                if deadline_at is not None and time.monotonic() > deadline_at:
                     raise LeanProcessException(
                         f"Lean REPL did not respond within {timeout}s"
                     )

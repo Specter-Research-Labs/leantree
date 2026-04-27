@@ -55,6 +55,8 @@ async def test_server_startup_shutdown(project_path: Path):
         assert "available_processes" in status
         assert "used_processes" in status
         assert "max_processes" in status
+        assert "total_processes" in status
+        assert "stopping_processes" in status
 
         # Stop server
         server.stop()
@@ -86,7 +88,7 @@ async def test_status_endpoint(project_path: Path):
         status = client.check_status()
 
         assert status["max_processes"] == 2
-        assert status["available_processes"] == 0
+        assert status["total_processes"] == 0
         assert status["used_processes"] == 0
 
         # Get a process and check status again

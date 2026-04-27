@@ -79,22 +79,30 @@ def keyboard_monitor(address: str, port: int, pool: LeanProcessPool):
             try:
                 status = client.check_status()
                 print(f"\n=== Server Status ===")
-                print(f"Processes: {status['available_processes']} available, "
-                      f"{status['used_processes']} used, "
-                      f"{status['starting_processes']} starting, "
-                      f"{status['max_processes']} max")
+                # ``used`` is processes held by actors right now; the
+                # rest are pool states.  ``stopping`` is the janitor
+                # backlog - persistently >0 means subprocess teardown
+                # is wedged.
+                print(
+                    f"Pool: {status['used_processes']} used, "
+                    f"{status['available_processes']} available, "
+                    f"{status['starting_processes']} starting, "
+                    f"{status['stopping_processes']} stopping  "
+                    f"({status['total_processes']}/{status['max_processes']} alive)"
+                )
                 print(f"RAM: {status['ram']['percent']:.1f}% used "
                       f"({status['ram']['used_bytes'] / (1024**3):.1f}GB / "
                       f"{status['ram']['total_bytes'] / (1024**3):.1f}GB)")
                 avg_cpu = sum(status['cpu_percent_per_core']) / len(status['cpu_percent_per_core'])
                 print(f"CPU: {avg_cpu:.1f}% average across {len(status['cpu_percent_per_core'])} cores")
 
-                # Show inactive processes and branches
-                inactive_proc = status.get('inactive_processes', 0)
-                total_proc = status.get('total_tracked_processes', 0)
-                inactive_br = status.get('inactive_branches', 0)
+                idle_too_long = status.get('idle_too_long_60s', 0)
+                inactive_br = status.get('inactive_branches_60s', 0)
                 total_br = status.get('total_branches', 0)
-                print(f"Inactive (>60s): {inactive_proc}/{total_proc} processes, {inactive_br}/{total_br} branches")
+                print(
+                    f"Idle >60s: {idle_too_long}/{status['total_processes']} pool entries, "
+                    f"{inactive_br}/{total_br} branches"
+                )
 
                 # Per-process memory. Snapshot pool.checkpoints.keys() so we don't iterate
                 # a dict being mutated by the event loop. Skip processes that fail to report

@@ -38,37 +38,64 @@ from leantree.repl_adapter.server import (
 class _FakePool:
     """Minimum shape of LeanProcessPool that LeanServer needs.
 
-    Only ``available_processes``, ``_num_used_processes``,
-    ``_num_starting_processes``, ``max_processes``, and the async
-    ``get_process_async`` / ``return_process_async`` methods are exercised
-    here, so we stub them out rather than spinning up real Lean.
+    Stubs out the new pool API (``acquire_async``, ``release``,
+    ``return_entry_async``, ``get_entry``, ``stats``, ``start``,
+    ``shutdown``) so we can exercise server behaviour without spinning up
+    real Lean. ``acquire_async`` simulates a fully-occupied pool by sleeping
+    until the caller's timeout fires - that's what lets these tests time
+    out the get-process path on a stuck loop.
     """
 
     def __init__(self, max_processes: int = 2):
         self.max_processes = max_processes
-        self.available_processes = []
-        self._num_used_processes = 0
-        self._num_starting_processes = 0
-        self._lock = None
+        self.has_active_request = lambda entry_id: False
+        # Backing state for stats(). Stays empty here - this fake never
+        # actually hands out an entry.
+        self._live: dict[int, object] = {}
+        self._lock = threading.Lock()
 
-    @property
-    def lock(self):
-        if self._lock is None:
-            self._lock = asyncio.Lock()
-        return self._lock
-
-    async def get_process_async(self, blocking: bool = True, timeout: float | None = None):
-        # Never returns a process - simulates a fully-occupied pool so the
-        # get_process_async coro has to wait (and we can time it out).
-        if blocking:
-            await asyncio.sleep(timeout if timeout is not None else 999)
+    def start(self, loop):
         return None
 
-    async def return_process_async(self, process):
+    async def start_async(self):
+        return None
+
+    def shutdown(self):
         return None
 
     async def shutdown_async(self):
         return None
+
+    async def acquire_async(self, timeout: float | None = None):
+        # Simulates a fully-occupied pool: never returns an entry.
+        if timeout is None:
+            await asyncio.sleep(999)
+        else:
+            await asyncio.sleep(timeout)
+        return None
+
+    async def return_entry_async(self, entry):
+        return None
+
+    def release(self, entry, *, recycle: bool, reason: str = ""):
+        return None
+
+    def get_entry(self, entry_id: int):
+        return None
+
+    def touch(self, entry):
+        return None
+
+    def stats(self):
+        from leantree.repl_adapter.process_pool import PoolStats
+        return PoolStats(
+            max_processes=self.max_processes,
+            total_processes=0,
+            available_processes=0,
+            starting_processes=0,
+            used_processes=0,
+            stopping_processes=0,
+        )
 
 
 @pytest.fixture

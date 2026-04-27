@@ -236,7 +236,8 @@ def status_printer(
         print(
             f"[t={elapsed:6.1f}s] "
             f"procs {status['used_processes']}u/{status['available_processes']}a/"
-            f"{status['starting_processes']}s/{status['max_processes']}m | "
+            f"{status['starting_processes']}s/{status['stopping_processes']}sp/"
+            f"{status['total_processes']}tot/{status['max_processes']}max | "
             f"branches {status.get('total_branches', 0)} | "
             f"tactics {snap['tactics']} ({tactics_per_sec:.1f}/s) | "
             f"acquired {snap['processes_acquired']} | "
