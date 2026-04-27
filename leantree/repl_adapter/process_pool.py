@@ -275,6 +275,33 @@ class LeanProcessPool:
                 break
             time.sleep(0.05)
 
+        # Cancel the janitor task on its own loop and wait for it to
+        # actually exit; otherwise the upcoming ``loop.stop()`` in the
+        # server's ``stop()`` would leave the task parked on
+        # ``inbox.get()`` and asyncio would log
+        # "Task was destroyed but it is pending!".
+        if (
+            self._janitor_task is not None
+            and self._loop is not None
+            and not self._janitor_task.done()
+        ):
+            cancelled = threading.Event()
+            def _cancel_and_wait():
+                async def _cancel():
+                    self._janitor_task.cancel()
+                    try:
+                        await self._janitor_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    cancelled.set()
+                asyncio.ensure_future(_cancel(), loop=self._loop)
+            try:
+                self._loop.call_soon_threadsafe(_cancel_and_wait)
+                cancelled.wait(timeout=5.0)
+            except RuntimeError:
+                # Loop closed already; nothing to do.
+                pass
+
         self._join_worker_threads()
 
     async def shutdown_async(self) -> None:
@@ -373,7 +400,8 @@ class LeanProcessPool:
 
     async def acquire_async(self, timeout: float | None = None) -> PoolEntry | None:
         """Async wrapper around `acquire`. On placeholder return, spawns
-        the subprocess outside any lock. On spawn failure, recycles the
+        the subprocess outside any lock and transitions the entry from
+        ``starting`` to ``checked_out``.  On spawn failure, recycles the
         placeholder (frees the capacity slot) and re-raises.
         """
         entry = await asyncio.to_thread(self.acquire, timeout)
@@ -389,6 +417,12 @@ class LeanProcessPool:
                 entry.process = process
                 entry.pid = process._proc.pid
                 entry.checkpoint = process.checkpoint()
+                # Promote out of "starting": this entry is now in the
+                # caller's hands.  Without this, /status would report it
+                # as a starting_processes count forever - including the
+                # used_processes wire field, which would mis-report 0.
+                entry.state = "checked_out"
+                entry.last_used = time.monotonic()
         return entry
 
     def release(self, entry: PoolEntry, *, recycle: bool, reason: str = "") -> None:

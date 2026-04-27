@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 import time
 from pathlib import Path
@@ -6,18 +7,45 @@ from pathlib import Path
 from leantree.repl_adapter.server import LeanServer, LeanClient, start_server
 from leantree.repl_adapter.process_pool import LeanProcessPool
 
-# Get REPL_EXE from conftest pattern
-REPL_EXE = Path("../lean-repl/.lake/build/bin/repl")
+
+def _resolve_repl_exe() -> Path:
+    """Locate the Lean REPL binary.  Resolves to an absolute path because
+    the LeanProcess runs ``lake env <repl_exe>`` with ``cwd=project_path``;
+    a relative path would be resolved against the project, not against
+    the test's cwd."""
+    env = os.environ.get("LEAN_REPL_EXE")
+    if env:
+        return Path(env).resolve()
+    for candidate in (
+        Path("lean-repl/.lake/build/bin/repl"),
+        Path("../lean-repl/.lake/build/bin/repl"),
+    ):
+        if candidate.exists():
+            return candidate.resolve()
+    raise FileNotFoundError(
+        "Lean REPL binary not found.  Set LEAN_REPL_EXE or run from the "
+        "leantree project root with lean-repl/ built."
+    )
+
+
+def _resolve_project_path() -> Path:
+    env = os.environ.get("LEAN_PROJECT_PATH")
+    if env:
+        return Path(env).resolve()
+    for candidate in (Path("leantree_project"), Path("../leantree_project")):
+        if candidate.exists():
+            return candidate.resolve()
+    raise FileNotFoundError(
+        "leantree_project not found. Set LEAN_PROJECT_PATH or follow the "
+        "Development section in README to create it."
+    )
+
+
+REPL_EXE = _resolve_repl_exe()
 
 
 def get_project_path():
-    """Get the project path for testing."""
-    project_path = Path("leantree_project")
-    if not project_path.exists():
-        raise FileNotFoundError(
-            f"Project path {project_path} does not exist. Please follow the Development section in README to create it."
-        )
-    return project_path
+    return _resolve_project_path()
 
 
 def get_free_port():
@@ -332,15 +360,17 @@ async def test_apply_tactic(project_path: Path):
             initial_state = proof_branch.state
             assert not initial_state.is_solved()
 
-            # Apply a tactic
+            # Apply a tactic.  ``decide`` closes the goal, so the
+            # try_apply_tactic result is success with an EMPTY list of
+            # remaining branches (every branch corresponds to a remaining
+            # subgoal; closing the proof leaves none).
             result = proof_branch.try_apply_tactic("decide")
             assert result.is_success()
             next_branches = result.value
-            assert len(next_branches) > 0
-
-            # Check if the proof is solved
-            new_state = next_branches[0].state
-            # Note: decide might solve it, or might not depending on the exact theorem
+            assert next_branches == [], (
+                f"`decide` should close `2 + 2 = 4`; got {len(next_branches)} "
+                f"remaining branches"
+            )
 
     finally:
         server.stop()
@@ -469,7 +499,12 @@ async def test_error_handling(project_path: Path):
             urllib.request.urlopen(req)
             assert False, "Should have raised an error"
         except urllib.error.HTTPError as e:
-            assert e.code == 500  # Server error for invalid process ID
+            # 404 for unknown process: the new pool-backed server reports
+            # "resource not found" rather than a generic 500 (the pre-redesign
+            # server raised ValueError from _get_process and let it bubble to
+            # the catch-all 500 branch; cleaner to surface the missing
+            # resource as 404).
+            assert e.code == 404
 
         # Test invalid theorem (no sorry) - this raises generic Exception in interaction.py, so it becomes 500 -> RuntimeError
         with client.get_process(blocking=True) as process:
@@ -562,6 +597,7 @@ async def run_all_tests():
         ("test_complete_proof_workflow", test_complete_proof_workflow),
     ]
 
+    failures: list[str] = []
     for test_name, test_func in tests:
         print(f"\n{'=' * 60}")
         print(f"Running {test_name}...")
@@ -576,18 +612,21 @@ async def run_all_tests():
             print(f"   {e}")
             import traceback
             traceback.print_exc()
-            return 1
+            failures.append(test_name)
         except Exception as e:
             print(f"\n❌ {test_name} failed with error:")
             print(f"   {e}")
             import traceback
             traceback.print_exc()
-            return 1
+            failures.append(test_name)
 
     print(f"\n{'=' * 60}")
-    print("All tests passed!")
+    if failures:
+        print(f"FAILED: {len(failures)} of {len(tests)} - {failures}")
+    else:
+        print("All tests passed!")
     print(f"{'=' * 60}")
-    return 0
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
