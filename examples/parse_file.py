@@ -14,4 +14,3 @@ for thm in file.theorems:
             print(f"Error: {by_block.tree}")
         print(by_block.tree.pretty_print() + "\n")
     print("-" * 100)
-

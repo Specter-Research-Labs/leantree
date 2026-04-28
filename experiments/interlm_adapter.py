@@ -16,12 +16,11 @@ class MiniF2F:
 
 
 class InterLMMiniF2FAdapter:
-    DATA_URL: Final[str] = \
+    DATA_URL: Final[str] = (
         "https://raw.githubusercontent.com/InternLM/InternLM-Math/refs/heads/main/minif2f/data/minif2f-lean4.7.0.jsonl"
-    VALIDATION_LEAN_FILE_URL: Final[str] = \
-        "<anonymized>"
-    IMPORTS_URL: Final[str] = \
-        "<anonymized>"
+    )
+    VALIDATION_LEAN_FILE_URL: Final[str] = "<anonymized>"
+    IMPORTS_URL: Final[str] = "<anonymized>"
 
     def __init__(self, cache_dir: Path):
         self.cache_dir = cache_dir

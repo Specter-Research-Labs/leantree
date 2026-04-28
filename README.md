@@ -136,55 +136,11 @@ with project.environment() as env:
 
 ## Datasets
 
-Assuming you have already created a Lean project in `leantree_project`, you can recreate the whole Mathlib dataset by running:
+Assuming you have already create a Lean project in `leantree_project`, you can recreate the whole Mathlib dataset by running:
 
 ```bash
-python dataset/tree_dataset.py generate \
-  --project_path leantree_project \
-  --source_files mathlib/Mathlib \
-  --output_dir leantree_generated \
-  --num_workers 16
+python dataset/tree_dataset.py generate --project_path leantree_project --source_files mathlib/Mathlib
 ```
-
-This uses a work-stealing pool of 16 worker processes and shows a live `tqdm` progress bar with running totals of extracted theorems, blocks, and failures. The default `--num_workers 1` runs sequentially.
-
-#### Sharded Generation (multi-node)
-
-For multi-node setups (e.g. SLURM array jobs), each node processes a disjoint shard
-via `--total_workers` / `--worker_id`. Each shard writes its own JSONL file
-(`leantree-sf=<source>-<worker_id>.jsonl`) and `.errors` file. Combine `--num_workers`
-within each shard to use multiple local processes.
-
-```bash
-python dataset/tree_dataset.py generate \
-  --project_path leantree_project \
-  --source_files mathlib/Mathlib \
-  --output_dir leantree_generated \
-  --total_workers $SLURM_ARRAY_TASK_COUNT \
-  --worker_id $SLURM_ARRAY_TASK_ID \
-  --num_workers 16
-```
-
-The last worker (`worker_id == total_workers - 1`) picks up any remainder files
-when `len(files)` isn't divisible by `total_workers`, so no files are dropped.
-
-#### Merging Shards
-
-After all shards finish, combine them into a single JSONL file:
-
-```bash
-python dataset/tree_dataset.py merge_shards leantree_generated \
-  --output_dir leantree_merged \
-  --shards_count $SLURM_ARRAY_TASK_COUNT
-```
-
-This produces `leantree_merged/leantree-sf=<source>.jsonl` by concatenating all shard
-files in `worker_id` order. It errors out if any shard file is missing, so you're
-guaranteed a complete dataset on success. Use `--force` to overwrite an existing
-output file.
-
-Note: `.errors` files are not merged; concatenate them manually if needed
-(`cat leantree_generated/*.errors > leantree_merged/all.errors`).
 
 ## Development
 

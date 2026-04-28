@@ -1,6 +1,11 @@
 from leantree.file_span import FileSpan
-from leantree.repl_adapter.data import ReplCompilationUnit, SingletonProofTreeNode, SingletonProofTree, \
-    SingletonProofTreeEdge, ReplProofStepInfo
+from leantree.repl_adapter.data import (
+    ReplCompilationUnit,
+    SingletonProofTreeNode,
+    SingletonProofTree,
+    SingletonProofTreeEdge,
+    ReplProofStepInfo,
+)
 
 # TODOO (!): add proof_runtime
 
@@ -82,7 +87,7 @@ class SingletonTreeBuilder:
                 assert goal_before.tactic is None, (
                     "Reusing closed goal!\n"
                     f"ID: {goal_before.id}\n"
-                    f"Already assigned tactic: {goal_before.tactic.tactic_string if goal_before.tactic is not None else "None"}\n"
+                    f"Already assigned tactic: {goal_before.tactic.tactic_string if goal_before.tactic is not None else 'None'}\n"
                     f"New tactic: {step.tactic_string}\n"
                     # f"{root.pretty_print()}"  # TODO
                 )
@@ -96,16 +101,19 @@ class SingletonTreeBuilder:
                     f"ID: {goal_before.id}\n"
                     f"Tactic: {tactic.tactic_string}\n"
                     f"... with children:\n"
-                    f"{"\n".join(f"{child.id} ---> {child.parent.id if child.parent else "None"}\n" for child in tactic.all_children())}"
+                    f"{'\n'.join(f'{child.id} ---> {child.parent.id if child.parent else "None"}\n' for child in tactic.all_children())}"
                     # f"\n{root.pretty_print()}"  # TODO
                 )
                 goal_before.set_edge(tactic)
             tree = SingletonProofTree(
                 root,
-                span=FileSpan.get_containing_span([
-                    n.tactic.span for n in root.get_subtree_nodes()
-                    if n.tactic is not None and n.tactic.span is not None
-                ])
+                span=FileSpan.get_containing_span(
+                    [
+                        n.tactic.span
+                        for n in root.get_subtree_nodes()
+                        if n.tactic is not None and n.tactic.span is not None
+                    ]
+                ),
             )
             return tree, i
 
@@ -120,6 +128,7 @@ class SingletonTreeBuilder:
     @classmethod
     def _check_if_unit_supported(cls, unit: ReplCompilationUnit):
         unsupported_tactics = [
+            "calc",
             "conv",
         ]
         for tactic in unsupported_tactics:

@@ -11,14 +11,15 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessor, L
 from tqdm import tqdm
 
 from leantree import utils
-from leantree.repl_adapter.interaction import LeanProcess, LeanInteractionException, LeanProcessException
+from leantree.repl_adapter.interaction import (
+    LeanProcess,
+    LeanInteractionException,
+    LeanProcessException,
+)
 from experiments.interlm_adapter import InterLMMiniF2FAdapter
 
-MINIF2F_HEADER = (
-    "import Mathlib\n"
-    "set_option maxHeartbeats 0\n"
-    "open BigOperators Real Nat Topology\n"
-)
+MINIF2F_HEADER = "import Mathlib\nset_option maxHeartbeats 0\nopen BigOperators Real Nat Topology\n"
+
 
 def get_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
@@ -50,6 +51,7 @@ ARGS_WHITELIST = [
     "temperature",
 ]
 
+
 class Logger:
     def __init__(self, log_dir: Path):
         self._model_outputs_path = log_dir / "model_outputs.txt"
@@ -68,7 +70,9 @@ class Logger:
                 f.write(f"{quotes}{output}\n{quotes}\n\n")
 
     def log_exception(self, theorem: str, exception: Exception, note: str):
-        error_traceback = ''.join(traceback.format_exception(type(exception), exception, exception.__traceback__))
+        error_traceback = "".join(
+            traceback.format_exception(type(exception), exception, exception.__traceback__)
+        )
         print(f"Unhandled exception ({note}): {exception}\n{error_traceback}")
         with open(self._exceptions_path, "a") as f:
             f.write(f"{theorem}\n")
@@ -86,9 +90,7 @@ class Logger:
         if not self._final_proofs_path.exists():
             with open(self._final_proofs_path, "w") as f:
                 f.write(MINIF2F_HEADER + "\n")
-                f.write(
-                    "-- Successful MiniF2F proofs found by whole proof generation\n\n"
-                )
+                f.write("-- Successful MiniF2F proofs found by whole proof generation\n\n")
 
         with open(self._final_proofs_path, "a") as f:
             f.write(unit + "\n\n")
@@ -97,9 +99,7 @@ class Logger:
         if not self._incomplete_proofs_path.exists():
             with open(self._incomplete_proofs_path, "w") as f:
                 f.write(MINIF2F_HEADER + "\n")
-                f.write(
-                    "-- Incomplete MiniF2F proofs found by whole proof generation\n\n"
-                )
+                f.write("-- Incomplete MiniF2F proofs found by whole proof generation\n\n")
 
         with open(self._incomplete_proofs_path, "a") as f:
             f.write(unit + "\n\n")
@@ -108,9 +108,7 @@ class Logger:
         if not self._error_proofs_path.exists():
             with open(self._error_proofs_path, "w") as f:
                 f.write(MINIF2F_HEADER + "\n")
-                f.write(
-                    "-- Failed MiniF2F proofs found by whole proof generation\n\n"
-                )
+                f.write("-- Failed MiniF2F proofs found by whole proof generation\n\n")
 
         with open(self._error_proofs_path, "a") as f:
             f.write(unit + "\n")
@@ -126,58 +124,65 @@ class Logger:
         runtime = time.time() - self._start_time
         return {
             "completed": len(completed_searches),
-
             "proven": len([r for r in completed_searches if r.proven]),
-            "proven_rate": len([r for r in completed_searches if r.proven]) / len(completed_searches) if completed_searches else 0,
-
+            "proven_rate": len([r for r in completed_searches if r.proven])
+            / len(completed_searches)
+            if completed_searches
+            else 0,
             "runtime": runtime,
         }
+
 
 prompt = """
 Complete the given Lean 4 code.
 Directly output the completed Lean 4 code without any additional text, comments, or reasoning.
 """.strip()
 
+
 class BanTokenLogitsProcessor(LogitsProcessor):
     """Processor that bans specific token IDs from being generated."""
-    
+
     def __init__(self, banned_token_ids):
         self.banned_token_ids = set(banned_token_ids)
-    
+
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-        # Set the logits for banned tokens to negative infinity
         for token_id in self.banned_token_ids:
-            scores[:, token_id] = float('-inf')
+            scores[:, token_id] = float("-inf")
         return scores
+
 
 class Model:
     def __init__(
-            self,
-            args: argparse.Namespace,
-            logger: Logger,
+        self,
+        args: argparse.Namespace,
+        logger: Logger,
     ):
         self.args = args
         self.logger = logger
-        self.model = AutoModelForCausalLM.from_pretrained(args.checkpoint, torch_dtype="auto", device_map="auto")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            args.checkpoint, torch_dtype="auto", device_map="auto"
+        )
         self.tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, padding_side="left")
         self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # Ban tokens: "sorry", "admit", "--", "/-".
         self.logits_processors = LogitsProcessorList(
-            [BanTokenLogitsProcessor([
-                7423,  # ▁sorry
-                20000,  # ▁admit
-                489,  # --
-                1192,  # ▁--
-                24028,  # /-
-            ])]
+            [
+                BanTokenLogitsProcessor(
+                    [
+                        7423,  # ▁sorry
+                        20000,  # ▁admit
+                        489,  # --
+                        1192,  # ▁--
+                        24028,  # /-
+                    ]
+                )
+            ]
         )
 
     def generate(self, statement: str) -> list[str]:
-        text = f"{prompt}\n\n```lean4\n{statement[:-len('sorry')]}\n  "
-        encoded = self.tokenizer(
-            [text], return_tensors="pt", padding=True, truncation=False
-        )
+        text = f"{prompt}\n\n```lean4\n{statement[: -len('sorry')]}\n  "
+        encoded = self.tokenizer([text], return_tensors="pt", padding=True, truncation=False)
         encoded = {k: v.to(self.model.device) for k, v in encoded.items()}
 
         print("Generating...")
@@ -191,10 +196,9 @@ class Model:
                 tokenizer=self.tokenizer,
                 num_return_sequences=self.args.max_passes,
                 temperature=self.args.temperature,
-                logits_processor=self.logits_processors,  # Add the logits processor
+                logits_processor=self.logits_processors,
             )
-        # Extract only the new tokens (exclude prompt tokens).
-        output_tokens = outputs[:, encoded["input_ids"].shape[1]:].tolist()
+        output_tokens = outputs[:, encoded["input_ids"].shape[1] :].tolist()
         output_decoded = self.tokenizer.batch_decode(output_tokens, skip_special_tokens=True)
 
         # Log the whole output including prompt and thinking.
@@ -207,10 +211,12 @@ class Model:
 
         return ["  " + proof.rstrip("```") for proof in output_decoded]
 
+
 class ProofResult(Enum):
     Incomplete = "incomplete"
     Completed = "completed"
     Error = "error"
+
 
 class Verifier:
     def __init__(self, args: argparse.Namespace, logger: Logger):
@@ -219,7 +225,9 @@ class Verifier:
 
         self.repl: LeanProcess | None = None
 
-    async def verify(self, theorem: str, proof: str) -> tuple[ProofResult, str, LeanInteractionException | str | None]:
+    async def verify(
+        self, theorem: str, proof: str
+    ) -> tuple[ProofResult, str, LeanInteractionException | str | None]:
         restarts = 0
         unit = self._create_verifiable_unit(theorem, proof)
         while True:
@@ -247,10 +255,7 @@ class Verifier:
                 self.repl = None  # Will be restarted at the start of next iteration.
 
     def _create_verifiable_unit(self, theorem: str, proof: str) -> str:
-        return (
-            theorem[:-len("sorry")].strip() + "\n" +
-            proof.rstrip()
-        )
+        return theorem[: -len("sorry")].strip() + "\n" + proof.rstrip()
 
     async def _restart_repl(self):
         if self.repl:
@@ -259,13 +264,20 @@ class Verifier:
         self.repl = LeanProcess(
             self.args.repl_exe,
             self.args.project_path,
-            # utils.Logger(utils.LogLevel.DEBUG),
         )
         await self.repl.start_async()
         await self.repl.send_command_async(MINIF2F_HEADER)
 
+
 class WholeProofSearch:
-    def __init__(self, args: argparse.Namespace, theorem: str, model: Model, verifier: Verifier, logger: Logger):
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        theorem: str,
+        model: Model,
+        verifier: Verifier,
+        logger: Logger,
+    ):
         self.args = args
         self.theorem = theorem
         self.model = model
@@ -278,11 +290,7 @@ class WholeProofSearch:
         output_decoded = self.model.generate(self.theorem)
 
         for output in output_decoded:
-            # proof = self._extract_proof(output)
             proof = output
-            # if proof is None:
-            #     self.logger.log_unknown_output(self.theorem, output)
-            #     continue
             result, unit, error = await self.verifier.verify(self.theorem, proof)
             if result == ProofResult.Completed:
                 self.proven = True
@@ -295,18 +303,10 @@ class WholeProofSearch:
                 self.logger.log_error_proof(unit, error)
         self.proven = False
 
-    # def _extract_proof(self, output: str) -> str | None:
-    #     match = re.search(r"```lean4?(.*?)```", output, re.DOTALL)
-    #     if not match:
-    #         return None
-    #     proof = match.group(1)
-    #     if ":= by" not in proof:
-    #         return None
-    #     proof = proof[proof.index(":= by") + len(":= by"):]
-    #     proof = "".join(line for line in proof.splitlines(keepends=True) if line.strip())
-    #     return proof
 
-async def run_searches(args: argparse.Namespace, theorems: list[str], model: Model, logger: Logger) -> list[WholeProofSearch]:
+async def run_searches(
+    args: argparse.Namespace, theorems: list[str], model: Model, logger: Logger
+) -> list[WholeProofSearch]:
     verifier = Verifier(args, logger)
     searches = []
     for theorem in tqdm(theorems):
@@ -316,15 +316,15 @@ async def run_searches(args: argparse.Namespace, theorems: list[str], model: Mod
         logger.log_stats(searches)
     return searches
 
+
 def mask_theorem_names(theorems: list[str]) -> list[str]:
     modified_theorems = []
     for theorem in theorems:
         words = theorem.split()
         assert len(words) > 2
-        modified_theorems.append(
-            "example" + theorem[len(words[0] + " " + words[1]):]
-        )
+        modified_theorems.append("example" + theorem[len(words[0] + " " + words[1]) :])
     return modified_theorems
+
 
 def main():
     args = get_parser().parse_args()
@@ -357,7 +357,9 @@ def main():
     assert len(completed_searches) == len(theorems)
 
     print(f"Completed {len(completed_searches)} theorems.")
-    print(f"Runtime: {end_time - start_time} seconds, {(end_time - start_time) / len(theorems)} seconds per theorem")
+    print(
+        f"Runtime: {end_time - start_time} seconds, {(end_time - start_time) / len(theorems)} seconds per theorem"
+    )
     logger.log_stats(completed_searches)
 
 

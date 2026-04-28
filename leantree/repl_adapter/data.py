@@ -36,19 +36,13 @@ class ReplProofStepInfo:
             mctx_before=MetavarGraph.from_dict(data["mctxBefore"]) if data["mctxBefore"] else None,
             mctx_after=MetavarGraph.from_dict(data["mctxAfter"]) if data["mctxAfter"] else None,
             tactic_depends_on=data["tacticDependsOn"],
-            span=FilePositionParser.create_file_span(data, file_line_lengths) if data["start"] else None,
-            ast=cls._try_parse_ast(data["infoTree"]),
+            span=FilePositionParser.create_file_span(data, file_line_lengths)
+            if data["start"]
+            else None,
+            ast=LeanAST.parse_from_string(data["infoTree"]["node"]["stx"]["raw"])
+            if data["infoTree"]
+            else None,
         )
-
-
-    @staticmethod
-    def _try_parse_ast(info_tree: dict | None):
-        if not info_tree:
-            return None
-        try:
-            return LeanAST.parse_from_string(info_tree["node"]["stx"]["raw"])
-        except (IndexError, KeyError, ValueError):
-            return None
 
 
 class ReplGoalInfo:
@@ -61,7 +55,11 @@ class ReplGoalInfo:
             # For some reason, Lean sometimes automatically adds parts like `._@._hyg.590` or `.Init.Data.Subtype`.
             # We ignore these.
             def tag_is_nonsense(tag: str) -> bool:
-                return tag.startswith("_") or tag[0] in string.digits or tag[0] in string.ascii_uppercase
+                return (
+                    tag.startswith("_")
+                    or tag[0] in string.digits
+                    or tag[0] in string.ascii_uppercase
+                )
 
             tag_parts = goal_info["username"].split(".")
             nonsense_indices = [i for i, tag in enumerate(tag_parts) if tag_is_nonsense(tag)]
@@ -71,12 +69,18 @@ class ReplGoalInfo:
         return LeanGoal(
             goal_info["type"],
             [
-                # Note: hyp["isProof"] is ignored.
-                LeanHypothesis(hyp["type"], hyp["username"], hyp["value"], hyp["id"])
+                LeanHypothesis(
+                    hyp["type"],
+                    hyp["username"],
+                    hyp["value"],
+                    hyp["id"],
+                    hyp.get("typeExpr"),
+                )
                 for hyp in goal_info["hyps"]
             ],
             username,
             goal_info["id"],
+            goal_info.get("typeExpr"),
         )
 
 
@@ -85,7 +89,7 @@ class FilePositionParser:
     def create_file_position(cls, data: dict, file_line_lengths: list[int]) -> FilePosition:
         line, column = data["line"], data["column"]
         # In lean-repl, lines are indexed from 1 and columns are indexed from 0.
-        return FilePosition(sum(file_line_lengths[:line - 1]) + column)
+        return FilePosition(sum(file_line_lengths[: line - 1]) + column)
 
     @classmethod
     def create_file_span(cls, data: dict, file_line_lengths: list[int]) -> FileSpan:
@@ -124,7 +128,9 @@ class SingletonProofTreeEdge:
     tactic_depends_on: list[str] | None
 
     @classmethod
-    def from_step_info(cls, step: ReplProofStepInfo, all_nodes: "dict[str, SingletonProofTreeNode]") -> Self:
+    def from_step_info(
+        cls, step: ReplProofStepInfo, all_nodes: "dict[str, SingletonProofTreeNode]"
+    ) -> Self:
         return SingletonProofTreeEdge(
             step.tactic_string,
             goal_before=step.goal_before,
@@ -137,13 +143,15 @@ class SingletonProofTreeEdge:
 
     @classmethod
     def create_synthetic(
-            cls,
-            tactic_string: str,
-            goal_before: LeanGoal | None,
-            spawned_goals: "list[SingletonProofTreeNode]",
-            goals_after: "list[SingletonProofTreeNode]",
+        cls,
+        tactic_string: str,
+        goal_before: LeanGoal | None,
+        spawned_goals: "list[SingletonProofTreeNode]",
+        goals_after: "list[SingletonProofTreeNode]",
     ) -> Self:
-        return SingletonProofTreeEdge(tactic_string, goal_before, spawned_goals, goals_after, None, None, None)
+        return SingletonProofTreeEdge(
+            tactic_string, goal_before, spawned_goals, goals_after, None, None, None
+        )
 
     def is_synthetic(self) -> bool:
         return self.span is None
@@ -167,7 +175,9 @@ class SingletonProofTreeNode:
         return SingletonProofTreeNode(goal, goal.mvar_id)
 
     @classmethod
-    def create_synthetic(cls, parent: Self | None = None, tactic: SingletonProofTreeEdge | None = None) -> Self:
+    def create_synthetic(
+        cls, parent: Self | None = None, tactic: SingletonProofTreeEdge | None = None
+    ) -> Self:
         return SingletonProofTreeNode(
             goal=None,
             id="synthetic_" + "".join(str(random.randint(0, 9)) for _ in range(10)),
@@ -257,7 +267,7 @@ class SingletonProofTree:
             assert isinstance(node, SingletonProofTreeNode)
             if node.goal is None:
                 return f"{node.id}\n<SYNTHETIC>"
-            return f"{node.id}\n{node.goal.tag + ": " if node.goal.tag else ""}{node.goal.type}"
+            return f"{node.id}\n{node.goal.tag + ': ' if node.goal.tag else ''}{node.goal.type}"
 
         def get_edge_label(node: SingletonProofTreeNode | IntermediateNode):
             if isinstance(node, IntermediateNode):

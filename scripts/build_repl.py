@@ -1,4 +1,4 @@
-""" 
+"""
 This script is part of pyproject.toml setup.
 
 It builds the Lean REPL.
@@ -16,6 +16,7 @@ def main():
     except subprocess.CalledProcessError as e:
         print("Error building Lean REPL:", e, file=sys.stderr)
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

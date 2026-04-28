@@ -1,0 +1,15 @@
+{"tactics":
+ [{"usedConstants":
+   ["f", "g", "instHAdd", "HAdd.hAdd", "Nat", "instAddNat", "rfl"],
+   "tactic": "exact rfl",
+   "proofState": 0,
+   "pos": {"line": 5, "column": 29},
+   "goals": "⊢ f + g = 39",
+   "endPos": {"line": 5, "column": 38}}],
+ "messages":
+ [{"severity": "info",
+   "pos": {"line": 5, "column": 0},
+   "endPos": {"line": 5, "column": 38},
+   "data": "Goals accomplished!"}],
+ "env": 0}
+

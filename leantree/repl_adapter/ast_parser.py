@@ -16,7 +16,9 @@ class LeanASTNode(ABC):
         for child in self.get_children():
             child.traverse_preorder(consumer)
 
-    def find_first_node(self, predicate: "Callable[[LeanASTNode], bool]") -> "Optional[LeanASTNode]":
+    def find_first_node(
+        self, predicate: "Callable[[LeanASTNode], bool]"
+    ) -> "Optional[LeanASTNode]":
         if predicate(self):
             return self
         for child in self.get_children():
@@ -38,9 +40,17 @@ class LeanASTNode(ABC):
 
         def get_node_label(n: LeanASTNode) -> str:
             if isinstance(n, LeanASTObject):
-                return n.type + " " + " ".join(c.value if isinstance(c, LeanASTLiteral) else "_" for c in n.args)
+                return (
+                    n.type
+                    + " "
+                    + " ".join(c.value if isinstance(c, LeanASTLiteral) else "_" for c in n.args)
+                )
             if isinstance(n, LeanASTArray):
-                return "[" + " ".join(c.value if isinstance(c, LeanASTLiteral) else "_" for c in n.items) + "]"
+                return (
+                    "["
+                    + " ".join(c.value if isinstance(c, LeanASTLiteral) else "_" for c in n.items)
+                    + "]"
+                )
             if isinstance(n, LeanASTLiteral):
                 return n.value
             raise Exception("Unknown AST node type.")
@@ -73,7 +83,7 @@ class LeanASTLiteral(LeanASTNode):
         return []
 
     def pretty_print(self) -> str:
-        if len(self.value) >= 2 and self.value[0] == self.value[-1] == "\"":
+        if len(self.value) >= 2 and self.value[0] == self.value[-1] == '"':
             return self.value[1:-1]
         if self.value.startswith("`"):
             return self.value[1:]
@@ -99,15 +109,17 @@ class LeanAST:
     @classmethod
     def parse_from_string(cls, s: str) -> "LeanAST":
         def skip_to_argument_end(start_idx: int) -> int:
-            assert s[start_idx] not in [*string.whitespace, *"()[]"], f"Argument started with '{s[start_idx]}'"
+            assert s[start_idx] not in [*string.whitespace, *"()[]"], (
+                f"Argument started with '{s[start_idx]}'"
+            )
             if s[start_idx:].startswith("`[anonymous]"):
                 return start_idx + len("`[anonymous]")
-            if s[start_idx] == "\"":
+            if s[start_idx] == '"':
                 i = start_idx + 1
                 escaped = False
                 while True:
                     if not escaped:
-                        if s[i] == "\"":
+                        if s[i] == '"':
                             break
                         elif s[i] == "\\":
                             escaped = True
@@ -119,7 +131,9 @@ class LeanAST:
             i = start_idx
             # Addresses arguments like «term(↑)»
             depths = {b: 0 for b in ["«»"]}
-            while i < len(s) and not (s[i] in [*string.whitespace, *")]"] and all(d == 0 for d in depths.values())):
+            while not (
+                s[i] in [*string.whitespace, *")]"] and all(d == 0 for d in depths.values())
+            ):
                 for b in depths:
                     if s[i] == b[0]:
                         depths[b] += 1
@@ -131,7 +145,7 @@ class LeanAST:
 
         def skip_whitespaces(start_idx: int) -> int:
             i = start_idx
-            while i < len(s) and s[i] in string.whitespace:
+            while s[i] in string.whitespace:
                 i += 1
             return i
 
@@ -148,7 +162,7 @@ class LeanAST:
         def read_subtree(start_idx: int) -> tuple[LeanASTObject, int]:
             assert s[start_idx] == "("
             type_end = skip_to_argument_end(start_idx + 1)
-            node_type = s[start_idx + 1:type_end]
+            node_type = s[start_idx + 1 : type_end]
             args = []
             i = type_end
             while s[i] != ")":

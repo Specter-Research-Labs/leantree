@@ -20,11 +20,7 @@ from leantree.repl_adapter.interaction import LeanProcess, LeanInteractionExcept
 from leantree.core.lean import LeanProofState, LeanGoal
 from experiments.interlm_adapter import InterLMMiniF2FAdapter
 
-MINIF2F_HEADER = (
-    "import Mathlib\n"
-    "set_option maxHeartbeats 0\n"
-    "open BigOperators Real Nat Topology\n"
-)
+MINIF2F_HEADER = "import Mathlib\nset_option maxHeartbeats 0\nopen BigOperators Real Nat Topology\n"
 
 
 # NOTE: Why is llama worse than deepseek prover?
@@ -36,16 +32,21 @@ MINIF2F_HEADER = (
 # graybox: model sees errors, but not proof state
 # blackbox: model does not even see errors (but knows when the proof is complete)
 
+
 def get_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--method", type=str, choices=["blackbox", "graybox", "whitebox"], required=True)
+    parser.add_argument(
+        "--method", type=str, choices=["blackbox", "graybox", "whitebox"], required=True
+    )
 
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--checkpoint", type=str, default="EleutherAI/llemma_7b")
     parser.add_argument("--per_device_batch_size", type=int, default=8)
     parser.add_argument("--max_gpus", type=int, default=0)
 
-    parser.add_argument("--max_steps", type=int, default=25, help="Maximum number of step attempts in one rollout.")
+    parser.add_argument(
+        "--max_steps", type=int, default=25, help="Maximum number of step attempts in one rollout."
+    )
     parser.add_argument("--max_rollouts", type=int, default=10)
 
     parser.add_argument("--max_tactic_length", type=int, default=128)
@@ -65,8 +66,16 @@ def get_parser() -> argparse.ArgumentParser:
 
 
 ARGS_WHITELIST = [
-    "seed", "checkpoint", "max_steps", "max_rollouts", "method", "enable_thinking",
-    "max_tactic_length", "temperature", "top_p", "top_k"
+    "seed",
+    "checkpoint",
+    "max_steps",
+    "max_rollouts",
+    "method",
+    "enable_thinking",
+    "max_tactic_length",
+    "temperature",
+    "top_p",
+    "top_k",
 ]
 
 
@@ -87,7 +96,9 @@ class Logger:
                 quotes = '"""\n'
                 f.write(f"{quotes}{output}\n{quotes}\n\n")
 
-    def log_rollout_step(self, proof_so_far: str, tactic: str | None, output: str, status: "ProofStatus | None"):
+    def log_rollout_step(
+        self, proof_so_far: str, tactic: str | None, output: str, status: "ProofStatus | None"
+    ):
         with open(self._rollout_steps_path, "a") as f:
             if tactic is None:
                 f.write(f"{proof_so_far}\n->INVALID SYNTAX:\n{output}")
@@ -101,7 +112,9 @@ class Logger:
             f.write(f"cause: {cause}\n\n")
 
     def log_exception(self, theorem: str, exception: Exception, note: str):
-        error_traceback = ''.join(traceback.format_exception(type(exception), exception, exception.__traceback__))
+        error_traceback = "".join(
+            traceback.format_exception(type(exception), exception, exception.__traceback__)
+        )
         print(f"Unhandled exception ({note}): {exception}\n{error_traceback}")
         with open(self._exceptions_path, "a") as f:
             f.write(f"{theorem}\n")
@@ -119,9 +132,7 @@ class Logger:
         if not self._final_proofs_path.exists():
             with open(self._final_proofs_path, "w") as f:
                 f.write(MINIF2F_HEADER + "\n")
-                f.write(
-                    "-- MiniF2F proofs found by linear rollouts\n\n"
-                )
+                f.write("-- MiniF2F proofs found by linear rollouts\n\n")
 
         proof = rollout.get_completed_proof()
         with open(self._final_proofs_path, "a") as f:
@@ -137,30 +148,33 @@ class Logger:
         runtime = time.time() - self._start_time
         return {
             "completed": len(completed_rollouts),
-
             "proven": len([r for r in completed_rollouts if r.proven]),
-            "proven_rate": len([r for r in completed_rollouts if r.proven]) / len(
-                completed_rollouts) if completed_rollouts else 0,
-
+            "proven_rate": len([r for r in completed_rollouts if r.proven])
+            / len(completed_rollouts)
+            if completed_rollouts
+            else 0,
             "total_steps": total_steps,
             "invalid_syntax_count": sum([r.invalid_syntax_count for r in completed_rollouts]),
-            "invalid_syntax_rate": sum([r.invalid_syntax_count for r in completed_rollouts]) / total_steps,
+            "invalid_syntax_rate": sum([r.invalid_syntax_count for r in completed_rollouts])
+            / total_steps,
             "exceptions_count": sum([r.total_exceptions for r in completed_rollouts]),
             "exceptions_rate": sum([r.total_exceptions for r in completed_rollouts]) / total_steps,
             "lean_errors_count": sum([r.total_lean_errors for r in completed_rollouts]),
-            "lean_errors_rate": sum([r.total_lean_errors for r in completed_rollouts]) / total_steps,
-
+            "lean_errors_rate": sum([r.total_lean_errors for r in completed_rollouts])
+            / total_steps,
             "total_repl_restarts": sum([r.repl_restarts for r in completed_rollouts]),
             "total_failed_rollouts": sum([r.failed_rollouts for r in completed_rollouts]),
-            "failed_rollouts_rate": sum(
-                [r.failed_rollouts for r in completed_rollouts]) / total_rollouts if total_rollouts > 0 else 0,
+            "failed_rollouts_rate": sum([r.failed_rollouts for r in completed_rollouts])
+            / total_rollouts
+            if total_rollouts > 0
+            else 0,
             "total_failed_searches": sum([r.failed for r in completed_rollouts]),
-            "failed_searches_rate": sum([r.failed for r in completed_rollouts]) / len(
-                completed_rollouts) if completed_rollouts else 0,
-
+            "failed_searches_rate": sum([r.failed for r in completed_rollouts])
+            / len(completed_rollouts)
+            if completed_rollouts
+            else 0,
             "total_expansions": sum([r.total_expansions for r in completed_rollouts]),
             "total_rollouts": sum([r.total_rollouts for r in completed_rollouts]),
-
             "runtime": runtime,
             "steps_per_second": total_steps / runtime,
         }
@@ -186,10 +200,10 @@ class BanTokenLogitsProcessor(LogitsProcessor):
 
 class SingleModel:
     def __init__(
-            self,
-            args,
-            model,
-            tokenizer,
+        self,
+        args,
+        model,
+        tokenizer,
     ):
         self.args = args
         self.model = model
@@ -197,20 +211,22 @@ class SingleModel:
 
         # Ban tokens: "sorry", "admit", "--", "/-".
         self.logits_processors = LogitsProcessorList(
-            [BanTokenLogitsProcessor([
-                7423,  # ▁sorry
-                20000,  # ▁admit
-                489,  # --
-                1192,  # ▁--
-                24028,  # /-
-            ])]
+            [
+                BanTokenLogitsProcessor(
+                    [
+                        7423,  # ▁sorry
+                        20000,  # ▁admit
+                        489,  # --
+                        1192,  # ▁--
+                        24028,  # /-
+                    ]
+                )
+            ]
         )
 
     def generate(self, statements: list[str]) -> tuple[list[str], list[str]]:
         texts = [f"{prompt}\n\n```lean4\n{statement}\n  " for statement in statements]
-        encoded = self.tokenizer(
-            texts, return_tensors="pt", padding=True, truncation=False
-        )
+        encoded = self.tokenizer(texts, return_tensors="pt", padding=True, truncation=False)
         encoded = {k: v.to(self.model.device) for k, v in encoded.items()}
 
         with torch.inference_mode():
@@ -226,8 +242,7 @@ class SingleModel:
                 tokenizer=self.tokenizer,
                 logits_processor=self.logits_processors,
             )
-        # Extract only the new tokens (exclude prompt tokens).
-        output_tokens = outputs[:, encoded["input_ids"].shape[1]:].tolist()
+        output_tokens = outputs[:, encoded["input_ids"].shape[1] :].tolist()
         proof_decoded = []
         for proof_tokens_single in output_tokens:
             proof = self.tokenizer.decode(proof_tokens_single, skip_special_tokens=True)
@@ -281,9 +296,9 @@ def _generate_on_device(idx_and_prompts):
 
 class ModelProvider:
     def __init__(
-            self,
-            args: argparse.Namespace,
-            logger: Logger,
+        self,
+        args: argparse.Namespace,
+        logger: Logger,
     ):
         self.args = args
         self.checkpoint = args.checkpoint
@@ -308,11 +323,11 @@ class ModelProvider:
         )
 
     def __enter__(self):
-        list(self.executor.map(
-            _process_init,
-            [self.args] * self.n_gpus,
-            [f"cuda:{i}" for i in range(self.n_gpus)]
-        ))
+        list(
+            self.executor.map(
+                _process_init, [self.args] * self.n_gpus, [f"cuda:{i}" for i in range(self.n_gpus)]
+            )
+        )
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -320,7 +335,7 @@ class ModelProvider:
 
     def generate(self, prompts: list[str]) -> list[str]:
         """
-        Splits `prompts` into batches of size `per_device_batch_size`, 
+        Splits `prompts` into batches of size `per_device_batch_size`,
         uses only as many GPUs as needed, runs generation in parallel,
         and returns the concatenated outputs.
         """
@@ -331,19 +346,17 @@ class ModelProvider:
                 f"per_device_batch_size ({batch_size}) × #GPUs ({self.n_gpus})."
             )
 
-        # determine how many GPUs (i.e. batches) we need
         n_batches = (len(prompts) + batch_size - 1) // batch_size
         assert n_batches <= self.n_gpus
 
-        chunks = [
-            prompts[i * batch_size: (i + 1) * batch_size]
-            for i in range(n_batches)
-        ]
+        chunks = [prompts[i * batch_size : (i + 1) * batch_size] for i in range(n_batches)]
 
         print(f"Generating {len(chunks)} chunk(s) on {n_batches} GPU(s)...")
         per_gpu_outputs = list(self.executor.map(_generate_on_device, enumerate(chunks)))
 
-        self.logger.log_model_outputs([sample for _, debug_log in per_gpu_outputs for sample in debug_log])
+        self.logger.log_model_outputs(
+            [sample for _, debug_log in per_gpu_outputs for sample in debug_log]
+        )
         return [out for batch, _ in per_gpu_outputs for out in batch]
 
 
@@ -362,7 +375,7 @@ def goal_to_theorem(goal: LeanGoal) -> str:
     for type, names in sorted(type_to_hyps.items(), key=lambda x: len(x[0])):
         hyps_str.append(f"({' '.join(names)} : {type})")
 
-    return f"example {" ".join(hyps_str)} : {goal.type} := by"
+    return f"example {' '.join(hyps_str)} : {goal.type} := by"
 
 
 class RolloutProofSearch:
@@ -426,7 +439,7 @@ class RolloutProofSearch:
             return goal_str
         else:
             assert self.args.method in ["graybox", "blackbox"]
-            return self.theorem[:-len("sorry")]
+            return self.theorem[: -len("sorry")]
 
     async def execute_step(self, response: str, timeout: float = 30):
         await asyncio.wait_for(self._execute_step(response), timeout)
@@ -445,11 +458,7 @@ class RolloutProofSearch:
         if not tactic:
             self.invalid_syntax_count += 1
             status = None
-        elif (
-                "sorry" in tactic or
-                "admit" in tactic or
-                "apply?" in tactic
-        ):
+        elif "sorry" in tactic or "admit" in tactic or "apply?" in tactic:
             self.total_lean_errors += 1
             status = ProofStatus.Error
         else:
@@ -484,13 +493,13 @@ class RolloutProofSearch:
 
     def _parse_response(self, response: str) -> str | None:
         lines = [
-            line for line in response.splitlines(keepends=True)
-            if
-            (
-                    line.strip() and
-                    not line.strip().startswith("--") and
-                    not line.strip().startswith("```") and
-                    not line.strip().startswith("theorem ")
+            line
+            for line in response.splitlines(keepends=True)
+            if (
+                line.strip()
+                and not line.strip().startswith("--")
+                and not line.strip().startswith("```")
+                and not line.strip().startswith("theorem ")
             )
         ]
         if not lines:
@@ -506,18 +515,18 @@ class RolloutProofSearch:
 
     def _postprocess_tactic(self, tactic: str) -> str:
         if "<;>" in tactic and not tactic.startswith("have "):
-            tactic = tactic[:tactic.index("<;>")]
+            tactic = tactic[: tactic.index("<;>")]
         if " with " in tactic:
-            tactic = tactic[:tactic.index(" with ")]
+            tactic = tactic[: tactic.index(" with ")]
         if ":= by" in tactic:
-            tactic = tactic[:tactic.index(":= by")]
+            tactic = tactic[: tactic.index(":= by")]
         if ";" in tactic:
-            tactic = tactic[:tactic.index(";")]
+            tactic = tactic[: tactic.index(";")]
         tactic = tactic.replace("`", "")
         tactic = tactic.rstrip(",")
 
         if tactic.startswith("by "):
-            tactic = tactic[len("by "):]
+            tactic = tactic[len("by ") :]
 
         return tactic.strip()
 
@@ -543,14 +552,19 @@ class RolloutProofSearch:
             response = await self.repl.send_command_async(completed_proof_str)
             if not any(m["data"] == "Goals accomplished!" for m in response["messages"]):
                 print(
-                    f"WARNING: No goals to be solved but the proof is not complete:\n {completed_proof_str}\n-->\n{response}")
+                    f"WARNING: No goals to be solved but the proof is not complete:\n {completed_proof_str}\n-->\n{response}"
+                )
                 return ProofStatus.Error
             return ProofStatus.Completed
         except LeanInteractionException as e:
-            print(f"WARNING: No goals to be solved but the proof threw an exception:\n {completed_proof_str}\n-->\n{e}")
+            print(
+                f"WARNING: No goals to be solved but the proof threw an exception:\n {completed_proof_str}\n-->\n{e}"
+            )
             return ProofStatus.Error
 
-    def _get_proof_str(self, include_sorry: bool = False, include_iterate_sorry: bool = False) -> str:
+    def _get_proof_str(
+        self, include_sorry: bool = False, include_iterate_sorry: bool = False
+    ) -> str:
         assert not (include_iterate_sorry and include_sorry)
         steps = self.proof
         if include_iterate_sorry:
@@ -559,15 +573,17 @@ class RolloutProofSearch:
             steps = steps + ["sorry"]
 
         return (
-                self.theorem[:-len("sorry")] +
-                ("\n" if len(steps) > 0 else "") +
-                "\n".join([f"  {tactic}" for tactic in steps])
+            self.theorem[: -len("sorry")]
+            + ("\n" if len(steps) > 0 else "")
+            + "\n".join([f"  {tactic}" for tactic in steps])
         )
 
 
 async def start_repls(args: argparse.Namespace, rollouts: list[RolloutProofSearch]):
     async def _start_repl(rollout: RolloutProofSearch):
-        print(f"Starting REPL for {rollout.theorem[:30]}{'...' if len(rollout.theorem) > 30 else ''}...")
+        print(
+            f"Starting REPL for {rollout.theorem[:30]}{'...' if len(rollout.theorem) > 30 else ''}..."
+        )
         assert rollout.repl is None
         repl = LeanProcess(
             args.repl_exe,
@@ -584,12 +600,16 @@ async def start_repls(args: argparse.Namespace, rollouts: list[RolloutProofSearc
 
 
 async def run_step(
-        rollouts: list[RolloutProofSearch], model_provider: ModelProvider
+    rollouts: list[RolloutProofSearch], model_provider: ModelProvider
 ) -> list[tuple[Exception, str] | None]:
     errors = [None] * len(rollouts)
 
-    prompts_and_errors = await asyncio.gather(*[rollout.next_prompt() for rollout in rollouts], return_exceptions=True)
-    prompts = cast(list[str] | None, [p for p in prompts_and_errors if not isinstance(p, Exception)])
+    prompts_and_errors = await asyncio.gather(
+        *[rollout.next_prompt() for rollout in rollouts], return_exceptions=True
+    )
+    prompts = cast(
+        list[str] | None, [p for p in prompts_and_errors if not isinstance(p, Exception)]
+    )
     for i in range(len(rollouts)):
         if isinstance(prompts_and_errors[i], Exception):
             errors[i] = (prompts_and_errors[i], "in rollout.next_prompt()")
@@ -617,10 +637,10 @@ async def run_step(
 
 
 async def run_rollouts(
-        args: argparse.Namespace,
-        theorems: list[str],
-        model_provider: ModelProvider,
-        logger: Logger,
+    args: argparse.Namespace,
+    theorems: list[str],
+    model_provider: ModelProvider,
+    logger: Logger,
 ) -> list[RolloutProofSearch]:
     pending_theorems = copy.copy(theorems)
     rollouts: list[RolloutProofSearch] = []
@@ -670,10 +690,12 @@ async def run_rollouts(
                         rollout.new_rollout()
                         logger.log_incomplete_rollout(
                             rollout._get_proof_str(include_sorry=False),
-                            f"REPL restarted too many times, again got exception {note}: {error}"
+                            f"REPL restarted too many times, again got exception {note}: {error}",
                         )
             elif rollout.steps_in_rollout >= args.max_steps:
-                logger.log_incomplete_rollout(rollout._get_proof_str(include_sorry=False), "max_steps reached")
+                logger.log_incomplete_rollout(
+                    rollout._get_proof_str(include_sorry=False), "max_steps reached"
+                )
                 rollout.new_rollout()
 
             if not done and rollout.total_rollouts >= args.max_rollouts:
@@ -698,9 +720,7 @@ def mask_theorem_names(theorems: list[str]) -> list[str]:
     for theorem in theorems:
         words = theorem.split()
         assert len(words) > 2
-        modified_theorems.append(
-            "example" + theorem[len(words[0] + " " + words[1]):]
-        )
+        modified_theorems.append("example" + theorem[len(words[0] + " " + words[1]) :])
     return modified_theorems
 
 
@@ -736,7 +756,9 @@ def main():
     assert len(completed_rollouts) == len(theorems)
 
     print(f"Completed {len(completed_rollouts)} theorems.")
-    print(f"Runtime: {end_time - start_time} seconds, {(end_time - start_time) / len(theorems)} seconds per theorem")
+    print(
+        f"Runtime: {end_time - start_time} seconds, {(end_time - start_time) / len(theorems)} seconds per theorem"
+    )
     logger.log_stats(completed_rollouts)
 
 

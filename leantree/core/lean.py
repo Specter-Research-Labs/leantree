@@ -11,9 +11,10 @@ class LeanHypothesis:
     user_name: str
     value: str | None
     mvar_id: str | None = None
+    type_expr: dict | None = None
 
     # Matches: "name : type", then optionally ":= value"
-    HypothesisLineRegex: ClassVar[re.Pattern] = re.compile(r"^([^:]+):(.+)", re.DOTALL)
+    HypothesisLineRegex: ClassVar[re.Pattern] = re.compile(r"^([^:]+):(.+)")
 
     # TODO: the decision what to serialize should be in the dataset generator, not here
     def serialize(self) -> dict:
@@ -28,9 +29,7 @@ class LeanHypothesis:
     @classmethod
     def deserialize(cls, data: dict) -> Self:
         return LeanHypothesis(
-            type=data["type"],
-            user_name=data["user_name"],
-            value=data.get("value")
+            type=data["type"], user_name=data["user_name"], value=data.get("value")
         )
 
     def __str__(self):
@@ -48,29 +47,30 @@ class LeanHypothesis:
         #   ∀ (x : α),
         #     traverse F ({ head := x, tail := tl } * { head := y, tail := L2 }) =
         #       (fun x1 x2 => x1 * x2) <$> traverse F { head := x, tail := tl } <*> traverse F { head := y, tail := L2 }
-        # to𝕜 : (E →L[ℝ] ℝ) → E →L[𝕜] 𝕜 := fun fr =>
-        #   let __LinearMap := (↑fr).extendTo𝕜';
-        #   { toLinearMap := __LinearMap, cont := ⋯ }
 
-        match = LeanHypothesis.HypothesisLineRegex.match(s.strip())
+        s = re.sub(r"\s+", " ", s.strip())
+
+        match = LeanHypothesis.HypothesisLineRegex.match(s)
         names_str, hyp_type = match.group(1).strip(), match.group(2).strip()
         names = names_str.split()
 
         value = None
-        assign_signs_index = cls._find_first_unbracketed_assign_sign(hyp_type)
-        if assign_signs_index is not None:
+        assign_signs_indices = cls._find_unbracketed_assign_signs(hyp_type)
+        assert len(assign_signs_indices) <= 1
+        if assign_signs_indices:
             hyp_type, value = (
-                hyp_type[:assign_signs_index].strip(),
-                hyp_type[assign_signs_index + 2:].strip()
+                hyp_type[: assign_signs_indices[0]].strip(),
+                hyp_type[assign_signs_indices[0] + 2 :].strip(),
             )
 
         return [LeanHypothesis(hyp_type, name, value) for name in names]
 
     # TODO: unit test
     @classmethod
-    def _find_first_unbracketed_assign_sign(cls, s: str) -> int | None:
+    def _find_unbracketed_assign_signs(cls, s: str) -> list[int]:
         brackets = ["()", "[]", "{}", "⦃⦄", "⟨⟩", "⁅⁆"]
         depths = {b: 0 for b in brackets}
+        result = []
         for i in range(len(s) - 1):
             for b in brackets:
                 if s[i] == b[0]:
@@ -78,9 +78,9 @@ class LeanHypothesis:
                 elif s[i] == b[1]:
                     assert depths[b] > 0
                     depths[b] -= 1
-            if s[i:i + 2] == ":=" and all(d == 0 for d in depths.values()):
-                return i
-        return None
+            if s[i : i + 2] == ":=" and all(d == 0 for d in depths.values()):
+                result.append(i)
+        return result
 
 
 @dataclass(eq=False, frozen=True)
@@ -89,6 +89,7 @@ class LeanGoal(ProofGoal):
     hypotheses: list[LeanHypothesis]
     tag: str | None
     mvar_id: str | None = None
+    type_expr: dict | None = None
 
     TagRegex: ClassVar[re.Pattern] = re.compile(r"^case\s+(\S+)")
     TargetSymbol: ClassVar[str] = "⊢"
@@ -112,11 +113,10 @@ class LeanGoal(ProofGoal):
         )
 
     def __str__(self):
-        hypotheses_str = "\n".join(str(h) for h in self.hypotheses)
         return (
-                (f"case {self.tag}\n" if self.tag else "") +
-                (hypotheses_str + "\n" if hypotheses_str else "") +
-                f"{self.TargetSymbol} {self.type}"
+            (f"case {self.tag}\n" if self.tag else "")
+            + "\n".join(h.__str__() for h in self.hypotheses)
+            + f"\n{self.TargetSymbol} {self.type}"
         )
 
     def with_(self, **changes) -> Self:
@@ -132,20 +132,16 @@ class LeanGoal(ProofGoal):
         if lines[0].startswith("case ") and ":" not in lines[0]:
             tag_match = LeanGoal.TagRegex.match(lines[0])
             tag = tag_match.group(1).strip()
-            goal_str = goal_str[len(tag_match.group(0)):].strip()
+            goal_str = goal_str[len(tag_match.group(0)) :].strip()
 
-        assert goal_str.count(LeanGoal.TargetSymbol) == 1, f"Expected exactly one '⊢' in the goal, but got {goal_str.count(LeanGoal.TargetSymbol)}"
+        assert goal_str.count(LeanGoal.TargetSymbol) == 1
         hypotheses_str, type_str = goal_str.split(LeanGoal.TargetSymbol)
 
         curr_hypothesis = ""
         hypotheses = []
         for line in [line for line in hypotheses_str.splitlines() if len(line.strip()) != 0]:
-            # Indented line means continuation of the hypothesis. So does a line without ":" (mostly).
-            # TODO: a line can contain ":" but still be a continuation; example:
-            #  map_sInf : let x := minAx.toCompleteLattice;                                                                                                                                                                                               
-            #  ∀ (s : Set α), f (sInf s) = ⨅ a ∈ s, f a
-            #  -> maybe use the semicolon as line continuation indicator
-            if curr_hypothesis and (line[0] != " " and ":" in line):
+            # We use the fact that subsequent lines of the same hypothesis are indented.
+            if curr_hypothesis and line[0] != " ":
                 hypotheses.extend(LeanHypothesis.from_string(curr_hypothesis))
                 curr_hypothesis = ""
             curr_hypothesis += line
@@ -154,7 +150,9 @@ class LeanGoal(ProofGoal):
 
         return cls(type_str.strip(), hypotheses, tag)
 
-    def semantic_equals(self, other: Self, ignore_metavars: bool = False, ignore_tags: bool = False) -> bool:
+    def semantic_equals(
+        self, other: Self, ignore_metavars: bool = False, ignore_tags: bool = False
+    ) -> bool:
         def normalize_str(s: str) -> str:
             return re.sub(r"\s+", " ", s)
 
@@ -164,33 +162,29 @@ class LeanGoal(ProofGoal):
         self_hyps = sorted([hyp_to_str(h) for h in self.hypotheses])
         other_hyps = sorted([hyp_to_str(h) for h in other.hypotheses])
 
-        # The problem with direct comparison of tags would be that there is no easy way to rename a goal, so we cannot
-        # ensure that the names always match. E.g. when we break down a `cases _ with | A => X | B => Y` into `cases _`,
-        # `case A; X`, and `case B; Y`, the goal name in X is `something` in the first case but `something.A` in the
-        # second case. Fortunately, it seems that tactics that operate with the goal name are OK when only some suffix
-        # of the name parts (separated by dots) is specified, which solves the problem in our case (because we are only
-        # removing the names, not changing them).
+        # Direct tag equality is unreliable: tactics can systematically rename goals (e.g. `cases` introduces
+        # suffixes like `.A`). We treat tags as matching if their dot-separated suffixes match, since Lean
+        # accepts goal-name suffixes in tactics and we only drop tags, not change goal structure.
         self_tags = self.tag.split(".") if self.tag else []
         other_tags = other.tag.split(".") if other.tag else []
         tag_equals = all(
             self_tag_part == other_tag_part
-            for self_tag_part, other_tag_part
-            in zip(reversed(self_tags), reversed(other_tags))
+            for self_tag_part, other_tag_part in zip(reversed(self_tags), reversed(other_tags))
         )
         if not ignore_metavars:
             return (
-                    normalize_str(self.type) == normalize_str(other.type) and
-                    self_hyps == other_hyps and
-                    (tag_equals or ignore_tags)
+                normalize_str(self.type) == normalize_str(other.type)
+                and self_hyps == other_hyps
+                and (tag_equals or ignore_tags)
             )
         else:
             return (
-                    self._equal_up_to_metavar(normalize_str(self.type), normalize_str(other.type)) and
-                    all(
-                        self._equal_up_to_metavar(self_hyp, other_hyp)
-                        for self_hyp, other_hyp in zip(self_hyps, other_hyps)
-                    ) and
-                    (tag_equals or ignore_tags)
+                self._equal_up_to_metavar(normalize_str(self.type), normalize_str(other.type))
+                and all(
+                    self._equal_up_to_metavar(self_hyp, other_hyp)
+                    for self_hyp, other_hyp in zip(self_hyps, other_hyps)
+                )
+                and (tag_equals or ignore_tags)
             )
 
     # TODO!!: this is a much harder problem! The metavar substitutions can contain spaces!
@@ -224,15 +218,12 @@ class LeanProofState(ProofState):
         return len(self.goals) == 0
 
     def semantic_equals(self, other: Self) -> bool:
-        return (
-                len(self.goals) == len(other.goals) and
-                all(g1.semantic_equals(g2) for g1, g2 in zip(self.goals, other.goals))
+        return len(self.goals) == len(other.goals) and all(
+            g1.semantic_equals(g2) for g1, g2 in zip(self.goals, other.goals)
         )
 
     def serialize(self) -> dict:
-        return {
-            "goals": [g.serialize() for g in self.goals]
-        }
+        return {"goals": [g.serialize() for g in self.goals]}
 
     @classmethod
     def deserialize(cls, data: dict) -> Self:

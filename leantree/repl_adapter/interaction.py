@@ -1,11 +1,12 @@
 import asyncio
 import json
+import os
 import re
+import resource
 from collections import deque
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
-from typing import Self, Any, AsyncIterator
+from typing import Any, AsyncIterator, Self
 
 import psutil
 
@@ -15,14 +16,41 @@ from leantree.core.lean import LeanGoal, LeanTactic, LeanProofState
 from leantree.core.lean_file import LeanTheorem, LeanFile, StoredError
 from leantree.file_span import FilePosition, FileSpan
 from leantree.metavar_graph import MetavarGraph
-from leantree.repl_adapter.data import ReplGoalInfo, ReplCompilationUnit, FilePositionParser, ReplProofStepInfo
-from leantree.utils import is_just_comments, ValueOrError, get_source_with_sorries, to_sync, to_sync_iterator
+from leantree.repl_adapter.data import (
+    ReplGoalInfo,
+    ReplCompilationUnit,
+    FilePositionParser,
+    ReplProofStepInfo,
+)
+from leantree.repl_adapter.error_metadata import (
+    normalize_repl_error_messages,
+    summarize_repl_error_messages,
+)
+from leantree.utils import (
+    get_source_with_sorries,
+    is_just_comments,
+    to_sync,
+    to_sync_iterator,
+    ValueOrError,
+)
+
+
+def _set_stack_limit():
+    """Set stack limit for subprocess - called via preexec_fn on Unix."""
+    try:
+        stack_size_kb = int(os.environ.get("LEAN_STACK_SIZE", "65536"))
+        _, hard = resource.getrlimit(resource.RLIMIT_STACK)
+        new_limit = min(stack_size_kb * 1024, hard)
+        resource.setrlimit(resource.RLIMIT_STACK, (new_limit, hard))
+    except (ValueError, OSError):
+        pass
 
 
 # TODO!: maybe not all sorries are reported: see https://github.com/leanprover-community/repl/issues/4
 #  E.g. in: `simpa using sorry`, the sorry is not detected
 
 # TODO: add some way to flush envIds and proofIds - maybe take inspiration from the itp-interface project
+
 
 @dataclass
 class RunnableUnit:
@@ -59,15 +87,19 @@ class RunnableFile:
             #
             # `(E.IsSolution fun n => q ^ n) ↔ IsRoot (@LinearRecurrence.charPoly α inst✝ E) q`
             before_theorem = FileSpan(curr_position, thm.span.start)
-            units.append(RunnableUnit(
-                span=before_theorem,
-            ))
+            units.append(
+                RunnableUnit(
+                    span=before_theorem,
+                )
+            )
 
-            units.append(RunnableUnit(
-                span=thm.span,
-                proof_mask=[block.span for block in thm.by_blocks],
-                theorem=thm,
-            ))
+            units.append(
+                RunnableUnit(
+                    span=thm.span,
+                    proof_mask=[block.span for block in thm.by_blocks],
+                    theorem=thm,
+                )
+            )
 
             curr_position = thm.span.finish
         return RunnableFile(
@@ -87,15 +119,13 @@ class PickledEnv:
 
 
 # TODO: maybe replace with `print axioms` to also catch `apply?`/`admit`
-# Matches `:= sorry` / `:=\n  sorry` so we can rewrite it to `:= by sorry`.
-# The `:=` is always preceded by whitespace in normal sources, so no `\b`
-# prefix (which only fires between word/non-word chars and thus silently
-# failed to match in the presence of that leading space).
-_eq_sorry_pattern = re.compile(r':=\s*sorry\b')
+_eq_sorry_pattern = re.compile(r"\b:=\s*sorry\b")
 
 
 class LeanProcess:
-    def __init__(self, repl_exe: Path, project_path: Path, logger: utils.Logger = None, pool: Any = None):
+    def __init__(
+        self, repl_exe: Path, project_path: Path, logger: utils.Logger = None, pool: Any = None
+    ):
         self.repl_exe = repl_exe
         self.project_path = project_path
         self.logger = logger if logger else utils.NullLogger()
@@ -113,7 +143,7 @@ class LeanProcess:
                 line = await self._proc.stderr.readline()
                 if not line:
                     break
-                decoded_line = line.decode('utf-8', errors='replace').strip()
+                decoded_line = line.decode("utf-8", errors="replace").strip()
                 if decoded_line:
                     self._stderr_buffer.append(decoded_line)
                     # Also log to debug so it's not lost if not an error
@@ -125,9 +155,12 @@ class LeanProcess:
         """Start the Lean REPL asynchronously."""
         assert self._proc is None
         self._stderr_buffer.clear()
-        cmd = ["lake", "env", str(self.repl_exe)]
+        lake_binary = utils.require_tool_binary("lake")
+        cmd = [str(lake_binary), "env", str(self.repl_exe)]
 
-        self.logger.debug(f"Starting Lean REPL with command: {cmd} (working directory: {self.project_path})")
+        self.logger.debug(
+            f"Starting Lean REPL with command: {cmd} (working directory: {self.project_path})"
+        )
         self._proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(self.project_path),
@@ -136,6 +169,7 @@ class LeanProcess:
             stderr=asyncio.subprocess.PIPE,
             # The limit argument sets the buffer limit for StreamReader wrappers for Process.stdout and Process.stderr.
             limit=16 * 1024 * 1024,  # 16 MB
+            preexec_fn=_set_stack_limit,  # Increase stack limit for Lean tactics
         )
         self._stderr_task = asyncio.create_task(self._monitor_stderr())
 
@@ -213,14 +247,14 @@ class LeanProcess:
     def rollback_to(self, checkpoint: LeanEnvironmentCheckpoint):
         self._env_id = checkpoint.env_id
 
-    async def _send_to_repl_async(self, data: dict) -> dict:
-        """Send data to the REPL asynchronously and return the response."""
+    async def _send_to_repl_async(self, data: dict) -> Any:
+        """Send data to the REPL asynchronously and return the parsed JSON response."""
         self._assert_started()
         serialized = json.dumps(data, ensure_ascii=False) + "\n\n"
 
         self.logger.debug(f"Sending to REPL: '{serialized[:-2]}'")
         try:
-            self._proc.stdin.write(serialized.encode('utf-8'))
+            self._proc.stdin.write(serialized.encode("utf-8"))
             await self._proc.stdin.drain()
 
             response_lines = []
@@ -230,7 +264,7 @@ class LeanProcess:
                     # EOF.
                     raise LeanProcessException("Lean REPL process ended unexpectedly")
 
-                decoded_line = line.decode('utf-8')
+                decoded_line = line.decode("utf-8")
                 if decoded_line.strip() == "":
                     # Empty line marks end of response.
                     break
@@ -242,18 +276,17 @@ class LeanProcess:
         self._log_repl_response(response_str)
         response = json.loads(response_str)
 
-        messages = response.get("messages", [])
-        errors = [m for m in messages if m["severity"] == "error"]
-        # TODO: handle warnings
-        warnings = [m for m in messages if m["severity"] == "warning" and m["data"] != "declaration uses 'sorry'"]
-        if len(errors) > 0:
-            raise LeanInteractionException(f"REPL returned error messages: {json.dumps(errors, ensure_ascii=False)}")
+        if isinstance(response, dict):
+            messages = response.get("messages", [])
+            errors = [m for m in messages if m["severity"] == "error"]
+            if len(errors) > 0:
+                raise LeanInteractionException.from_repl_messages(errors)
 
-        message = response.get("message")
-        if message == "Operation timed out":
-            raise LeanInteractionException("Tactic application timed out.")
-        if message and message.startswith("Lean error:"):
-            raise LeanInteractionException(f"REPL returned error: {message}")
+            message = response.get("message")
+            if message == "Operation timed out":
+                raise LeanInteractionException("Tactic application timed out.")
+            if message and message.startswith("Lean error:"):
+                raise LeanInteractionException(f"REPL returned error: {message}")
 
         return response
 
@@ -292,7 +325,9 @@ class LeanProcess:
         except json.JSONDecodeError:
             self.logger.debug(f"Received from REPL (could not parse): '{response_str}'")
 
-    async def send_command_async(self, command: str, proof_trees: bool = False, info_trees: bool = False) -> dict:
+    async def send_command_async(
+        self, command: str, proof_trees: bool = False, info_trees: bool = False
+    ) -> dict:
         """Send a command to the REPL asynchronously and return the response."""
         self._assert_started()
 
@@ -309,16 +344,7 @@ class LeanProcess:
 
         response = await self._send_to_repl_async(data)
 
-        if "env" not in response:
-            # REPL returned a fatal error without advancing the environment.
-            # Typical cause: a parse or elaboration failure severe enough that
-            # no new env snapshot was produced. Surface the payload as a
-            # LeanInteractionException so callers (e.g., proof_from_sorry)
-            # can report it cleanly instead of asserting.
-            message = response.get("message")
-            raise LeanInteractionException(
-                f"No `env` in REPL response. message={message!r} response={response!r}"
-            )
+        assert "env" in response, f"no `env` in REPL response with keys: {response.keys()}"
         self._env_id = response["env"]
         return response
 
@@ -364,25 +390,114 @@ class LeanProcess:
 
     unpickle = to_sync(unpickle_async)
 
+    async def prune_snapshots_async(
+        self,
+        *,
+        cmd_from_id: int | None = None,
+        proof_from_id: int | None = None,
+    ) -> None:
+        """Free REPL memory by dropping snapshots with id >= given bounds.
+
+        This is only safe if you know there are no live references to pruned `env`/`proofState` ids.
+        """
+        self._assert_started()
+        if cmd_from_id is None and proof_from_id is None:
+            return
+        if cmd_from_id is not None and self._env_id is not None and cmd_from_id <= self._env_id:
+            raise ValueError(
+                f"Refusing to prune command snapshots at cmd_from_id={cmd_from_id} because current env id is {self._env_id}."
+            )
+
+        response = await self._send_to_repl_async(
+            {"cmdFromId": cmd_from_id, "proofFromId": proof_from_id}
+        )
+        if response != "OK":
+            raise LeanInteractionException(f"pruneSnapshots failed: {response!r}")
+
+    prune_snapshots = to_sync(prune_snapshots_async)
+
+    async def inspect_proof_state_async(
+        self,
+        proof_state: int,
+        *,
+        include_proof_term: bool = False,
+        include_partial_proof_term: bool = False,
+        include_step_verification: bool = False,
+        include_proof_action_summary: bool = False,
+    ) -> dict:
+        """Read an existing proof snapshot without running another tactic."""
+        self._assert_started()
+        response = await self._send_to_repl_async(
+            {
+                "proofState": proof_state,
+                "includeProofTerm": include_proof_term,
+                "includePartialProofTerm": include_partial_proof_term,
+                "includeStepVerification": include_step_verification,
+                "includeProofActionSummary": include_proof_action_summary,
+            }
+        )
+        if "goals" not in response:
+            raise LeanInteractionException(
+                f"Could not inspect proof state in REPL: {json.dumps(response)}"
+            )
+        return response
+
+    inspect_proof_state = to_sync(inspect_proof_state_async)
+
+    async def check_def_eq_async(self, expr1_dag: dict, expr2_dag: dict) -> bool:
+        """Check if two expressions are definitionally equal using Lean kernel.
+
+        Args:
+            expr1_dag: ExprDAG.Json format dict for first expression
+            expr2_dag: ExprDAG.Json format dict for second expression
+
+        Returns:
+            True if expressions are definitionally equal, False otherwise.
+
+        Raises:
+            LeanInteractionException: If the check fails or env is not set.
+        """
+        self._assert_started()
+        if self._env_id is None:
+            raise LeanInteractionException("No environment set. Send a command first.")
+
+        data = {
+            "env": self._env_id,
+            "expr1": expr1_dag,
+            "expr2": expr2_dag,
+        }
+        response = await self._send_to_repl_async(data)
+
+        if "error" in response and response["error"]:
+            raise LeanInteractionException(f"DefEq check failed: {response['error']}")
+
+        return response.get("isDefEq", False)
+
+    check_def_eq = to_sync(check_def_eq_async)
+
     def _assert_started(self):
         if self._proc is None:
-            raise Exception(
+            raise LeanProcessException(
                 "Subprocess not started. Use 'with LeanProcess(...) as env:' or 'async with LeanProcess(...) as env:'"
             )
         if self._proc.returncode is not None:
             stderr_tail = "\n".join(self._stderr_buffer)
-            raise Exception(
+            raise LeanProcessException(
                 f"Subprocess has terminated with exit code {self._proc.returncode}.\n"
                 f"Stderr output:\n{stderr_tail}\n"
                 "Use 'with LeanProcess(...) as env:' or 'async with LeanProcess(...) as env:'"
             )
 
-    async def proofs_from_sorries_async(self, theorem_with_sorries: str) -> "AsyncIterator[LeanProofBranch]":
+    async def proofs_from_sorries_async(
+        self, theorem_with_sorries: str
+    ) -> "AsyncIterator[LeanProofBranch]":
         """Start proofs from sorries asynchronously."""
         self._assert_started()
         response = await self.send_command_async(theorem_with_sorries)
         if "sorries" not in response:
-            raise Exception(f"No `sorries` in REPL response. Make sure your theorem contains a 'sorry' keyword.")
+            raise Exception(
+                "No `sorries` in REPL response. Make sure your theorem contains a 'sorry' keyword."
+            )
         sorries = response["sorries"]
         goals = [ReplGoalInfo.goal_from_repl_data(sorry_data["goalInfo"]) for sorry_data in sorries]
         for sorry_data, goal in zip(sorries, goals):
@@ -400,28 +515,25 @@ class LeanProcess:
     proof_from_sorry = to_sync(proof_from_sorry_async)
 
     async def file_proofs_async(
-            self,
-            file: LeanFile,
+        self,
+        file: LeanFile,
     ) -> "AsyncIterator[tuple[LeanTheorem, list[LeanProofBranch] | Exception]]":
         """Start file proofs asynchronously."""
-        async for unit, sorry_branches in self.runnable_proofs_async(RunnableFile.from_lean_file(file)):
+        async for unit, sorry_branches in self.runnable_proofs_async(
+            RunnableFile.from_lean_file(file)
+        ):
             if isinstance(sorry_branches, Exception):
                 yield unit.theorem, sorry_branches
                 continue
             if unit.theorem is not None:
-                if len(sorry_branches) != len(unit.theorem.by_blocks):
-                    yield unit.theorem, Exception(
-                        f"Mismatch between REPL sorry branches ({len(sorry_branches)}) "
-                        f"and tree-builder by-blocks ({len(unit.theorem.by_blocks)})."
-                    )
-                    continue
+                assert len(sorry_branches) == len(unit.theorem.by_blocks)
                 yield unit.theorem, sorry_branches
 
     file_proofs = to_sync_iterator(file_proofs_async)
 
     async def runnable_proofs_async(
-            self,
-            file: RunnableFile,
+        self,
+        file: RunnableFile,
     ) -> "AsyncIterator[tuple[RunnableUnit, list[LeanProofBranch] | Exception]]":
         """Start runnable proofs asynchronously."""
         self._assert_started()
@@ -436,7 +548,9 @@ class LeanProcess:
 
             if unit.proof_mask:
                 try:
-                    source_with_sorries = get_source_with_sorries(unit.span, unit.proof_mask, file_content=file_content)
+                    source_with_sorries = get_source_with_sorries(
+                        unit.span, unit.proof_mask, file_content=file_content
+                    )
                     response = await self.send_command_async(source_with_sorries)
                 except (AssertionError, LeanInteractionException) as e:
                     yield unit, e
@@ -448,14 +562,19 @@ class LeanProcess:
             sorry_branches = []
             if "sorries" in response:
                 sorries = response["sorries"]
-                goals = [ReplGoalInfo.goal_from_repl_data(sorry_data["goalInfo"]) for sorry_data in sorries]
+                goals = [
+                    ReplGoalInfo.goal_from_repl_data(sorry_data["goalInfo"])
+                    for sorry_data in sorries
+                ]
                 for sorry_data, goal in zip(sorries, goals):
                     sorry_branches.append(LeanProofBranch(self, sorry_data["proofState"], goal))
             yield unit, sorry_branches
 
     runnable_proofs = to_sync_iterator(runnable_proofs_async)
 
-    async def full_proofs_async(self, file: LeanFile) -> "AsyncIterator[tuple[LeanTheorem, LeanProofBranch]]":
+    async def full_proofs_async(
+        self, file: LeanFile
+    ) -> "AsyncIterator[tuple[LeanTheorem, LeanProofBranch]]":
         """Start full proofs asynchronously."""
         pass  # TODO: Implement this method
 
@@ -473,11 +592,9 @@ class LeanProcess:
                     break
                 print(f"{print_prefix}{line.decode('utf-8')}", end="")
 
-        # Create tasks to read from stdout and stderr
         stdout_task = asyncio.create_task(read_and_print_stream(self._proc.stdout))
         stderr_task = asyncio.create_task(read_and_print_stream(self._proc.stderr, "STDERR: "))
 
-        # Read user input and send it to subprocess stdin
         try:
             loop = asyncio.get_event_loop()
             while self._proc.returncode is None:
@@ -485,16 +602,14 @@ class LeanProcess:
                 user_input = await loop.run_in_executor(None, input)
                 if not user_input:
                     break
-                self._proc.stdin.write((user_input + "\n").encode('utf-8'))
+                self._proc.stdin.write((user_input + "\n").encode("utf-8"))
                 await self._proc.stdin.drain()
         except (EOFError, BrokenPipeError, KeyboardInterrupt):
             print("User interrupted input or pipe broken. Exiting control mode.")
         finally:
-            # Wait for the subprocess to exit
             if self._proc.returncode is None:
                 self._proc.kill()
             await self._proc.wait()
-            # Cancel the reading tasks
             stdout_task.cancel()
             stderr_task.cancel()
             try:
@@ -508,39 +623,8 @@ class LeanProcess:
 
     take_control = to_sync(take_control_async)
 
-    def memory_usage(self) -> int:
-        """
-        Returns the PSS (Proportional Set Size) memory usage of the Lean REPL process
-        and all its children in bytes. PSS divides shared pages by the number of
-        processes sharing them, avoiding the overcounting that RSS suffers from when
-        many processes share memory-mapped files (e.g. Mathlib .olean files).
-
-        Falls back to RSS on platforms where PSS is unavailable (non-Linux).
-        """
-        self._assert_started()
-        try:
-            process = psutil.Process(self._proc.pid)
-            total = self._process_pss_or_rss(process)
-            for child in process.children(recursive=True):
-                try:
-                    total += self._process_pss_or_rss(child)
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-            return total
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error) as e:
-            raise LeanProcessException(f"Failed to get memory usage", e)
-
-    @staticmethod
-    def _process_pss_or_rss(process: psutil.Process) -> int:
-        """Return PSS if available (Linux), otherwise fall back to RSS."""
-        try:
-            return process.memory_full_info().pss
-        except (AttributeError, psutil.AccessDenied):
-            return process.memory_info().rss
-
     def virtual_memory_usage(self) -> int:
         """
-        Deprecated: Use memory_usage() instead.
         Returns the virtual memory size (VMS) of the Lean REPL process in bytes.
         """
         self._assert_started()
@@ -549,7 +633,7 @@ class LeanProcess:
             mem_info = process.memory_info()
             return mem_info.vms
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error) as e:
-            raise LeanProcessException(f"Failed to get memory usage", e)
+            raise LeanProcessException("Failed to get memory usage", e)
 
     async def send_theorem_async(self, theorem_str: str) -> ReplCompilationUnit:
         """Send a theorem to the REPL asynchronously."""
@@ -589,12 +673,19 @@ class LeanProcess:
 
 
 class LeanProofBranch(ProofBranch[LeanGoal, LeanTactic]):
-    def __init__(self, env: LeanProcess, proof_state_id: int, all_goals: list[LeanGoal] | LeanGoal,
-                 goals_mask: list[bool] = None):
+    def __init__(
+        self,
+        env: LeanProcess,
+        proof_state_id: int,
+        all_goals: list[LeanGoal] | LeanGoal,
+        goals_mask: list[bool] = None,
+        last_response: dict = None,
+    ):
         self._env = env
         self._proof_state_id = proof_state_id
         self._all_goals = all_goals if isinstance(all_goals, list) else [all_goals]
         self._goals_mask = goals_mask
+        self._last_response = last_response
         assert self._goals_mask is None or len(self._all_goals) == len(self._goals_mask)
 
     def __str__(self):
@@ -604,21 +695,114 @@ class LeanProofBranch(ProofBranch[LeanGoal, LeanTactic]):
     def state(self) -> LeanProofState:
         if self._goals_mask is None:
             return LeanProofState([goal for goal in self._all_goals])
-        return LeanProofState([goal for goal, visible in zip(self._all_goals, self._goals_mask) if visible])
+        return LeanProofState(
+            [goal for goal, visible in zip(self._all_goals, self._goals_mask) if visible]
+        )
 
     @property
     def is_solved(self) -> bool:
         return self.state.is_solved()
 
-    async def _send_tactic_async(self, tactic: str, timeout: int | None = 1000) -> dict:
+    def get_proof_term_json(self) -> dict | None:
+        if not self.is_solved:
+            return None
+        if self._last_response is None:
+            return None
+        return self._last_response.get("proofTerm")
+
+    def get_partial_proof_term_json(self) -> dict | None:
+        if self._last_response is None:
+            return None
+        return self._last_response.get("partialProofTerm")
+
+    def get_metavar_graph(self) -> MetavarGraph | None:
+        if self._last_response is None:
+            return None
+        mctx_after = self._last_response.get("mctxAfter")
+        if not isinstance(mctx_after, dict):
+            return None
+        return MetavarGraph.from_dict(mctx_after)
+
+    def get_tactic_depends_on(self) -> list[str]:
+        if self._last_response is None:
+            return []
+        summary = self._last_response.get("proofActionSummary")
+        if not isinstance(summary, dict):
+            return []
+        raw = summary.get("tacticDependsOn")
+        if not isinstance(raw, list):
+            return []
+        return [value.strip() for value in raw if isinstance(value, str) and value.strip()]
+
+    def get_spawned_goals(self) -> list[LeanGoal]:
+        if self._last_response is None:
+            return []
+        summary = self._last_response.get("proofActionSummary")
+        if not isinstance(summary, dict):
+            return []
+        raw = summary.get("spawnedGoals")
+        if not isinstance(raw, list):
+            return []
+        return [
+            ReplGoalInfo.goal_from_repl_data(goal_info)
+            for goal_info in raw
+            if isinstance(goal_info, dict)
+        ]
+
+    def get_proof_step_count(self) -> int:
+        if self._last_response is None:
+            return 0
+        summary = self._last_response.get("proofActionSummary")
+        if not isinstance(summary, dict):
+            return 0
+        raw = summary.get("proofStepCount")
+        if isinstance(raw, int) and raw >= 0:
+            return raw
+        return 0
+
+    async def _send_tactic_async(
+        self,
+        tactic: str,
+        timeout: int | None = 1000,
+        *,
+        include_proof_term: bool = False,
+        include_partial_proof_term: bool = False,
+        include_step_verification: bool = False,
+        include_proof_action_summary: bool = False,
+    ) -> dict:
         data = {
             "tactic": tactic,
             "proofState": self._proof_state_id,
+            "includeProofTerm": include_proof_term,
+            "includePartialProofTerm": include_partial_proof_term,
+            "includeStepVerification": include_step_verification,
+            "includeProofActionSummary": include_proof_action_summary,
         }
         if timeout is not None:
             data["timeout"] = timeout
 
         response = await self._env._send_to_repl_async(data)
+        return response
+
+    async def inspect_async(
+        self,
+        *,
+        include_proof_term: bool = False,
+        include_partial_proof_term: bool = False,
+        include_step_verification: bool = False,
+        include_proof_action_summary: bool = False,
+    ) -> dict:
+        response = await self._env.inspect_proof_state_async(
+            self._proof_state_id,
+            include_proof_term=include_proof_term,
+            include_partial_proof_term=include_partial_proof_term,
+            include_step_verification=include_step_verification,
+            include_proof_action_summary=include_proof_action_summary,
+        )
+        self._proof_state_id = response["proofState"]
+        self._last_response = response
+        self._all_goals = LeanProcess._goals_from_response(response)
+        self._goals_mask = None
         return response
 
     async def _delete_masked_goals_async(self):
@@ -635,7 +819,6 @@ class LeanProofBranch(ProofBranch[LeanGoal, LeanTactic]):
         i = 0
         while i < len(self._all_goals):
             if self._goals_mask[i]:
-                # Non-masked goal.
                 i += 1
                 continue
             span_start = i
@@ -648,13 +831,10 @@ class LeanProofBranch(ProofBranch[LeanGoal, LeanTactic]):
         i = 0
         for start, end in masked_spans:
             if start != i:
-                # Skip non-masked goals.
                 tactics.append(f"rotate_left {start - i}")
-            # Get rid of masked goals.
             tactics.append(f"iterate {end - start} sorry")
             i = end
         if i < len(self._all_goals):
-            # Make sure the order of non-masked goals is not changed.
             tactics.append(f"rotate_left {len(self._all_goals) - i}")
 
         response = None
@@ -669,14 +849,14 @@ class LeanProofBranch(ProofBranch[LeanGoal, LeanTactic]):
         self._goals_mask = None
 
     async def apply_tactic_async(
-            self,
-            tactic: LeanTactic | str,
-            # Tactics rw?, apply?, exact? technically close the main goal, but the proof is invalid. Setting
-            # ban_search_tactics disallows these. Consider e.g.:
-            # example : 1 = 0 := by
-            #   apply?
-            ban_search_tactics: bool = True,
-            timeout: int | None = 1000,
+        self,
+        tactic: LeanTactic | str,
+        # Tactics rw?, apply?, exact? technically close the main goal, but the proof is invalid. Setting
+        # ban_search_tactics disallows these. Consider e.g.:
+        # example : 1 = 0 := by
+        #   apply?
+        ban_search_tactics: bool = True,
+        timeout: int | None = 1000,
     ) -> list[Self]:
         assert not self.state.is_solved(), "This proof branch is already solved."
         if isinstance(tactic, LeanTactic):
@@ -686,9 +866,15 @@ class LeanProofBranch(ProofBranch[LeanGoal, LeanTactic]):
         # Normalize the proof state by removing masked goals.
         await self._delete_masked_goals_async()
 
-        response = await self._send_tactic_async(tactic, timeout=timeout)
+        response = await self._send_tactic_async(
+            tactic,
+            timeout=timeout,
+            include_proof_action_summary=False,
+        )
         if "goals" not in response:
-            raise LeanInteractionException(f"Could not apply tactic in REPL: {json.dumps(response)}")
+            raise LeanInteractionException(
+                f"Could not apply tactic in REPL: {json.dumps(response)}"
+            )
         new_proof_state = response["proofState"]
         step_error = self.step_error_from_response(response)
         if step_error:
@@ -697,16 +883,28 @@ class LeanProofBranch(ProofBranch[LeanGoal, LeanTactic]):
         metavar_graph = MetavarGraph.from_dict(response["mctxAfter"])
 
         next_states = []
-        for branch_goals in metavar_graph.partition_independent_goals(new_goals):
-            next_states.append(LeanProofBranch(
-                self._env,
-                new_proof_state,
-                new_goals,
-                goals_mask=[g in branch_goals for g in new_goals],
-            ))
+        if not new_goals:
+            next_states.append(
+                LeanProofBranch(
+                    self._env,
+                    new_proof_state,
+                    [],
+                    goals_mask=None,
+                    last_response=response,
+                )
+            )
+        else:
+            for branch_goals in metavar_graph.partition_independent_goals(new_goals):
+                next_states.append(
+                    LeanProofBranch(
+                        self._env,
+                        new_proof_state,
+                        new_goals,
+                        goals_mask=[g in branch_goals for g in new_goals],
+                        last_response=response,
+                    )
+                )
 
-        # `sorries` can be generated e.g. when executing a `have` tactic. They create an entirely new proofState with a
-        # single goal.
         for sorry_data in response.get("sorries", []):
             goal = ReplGoalInfo.goal_from_repl_data(sorry_data["goalInfo"])
             next_states.append(LeanProofBranch(self._env, sorry_data["proofState"], goal))
@@ -721,15 +919,87 @@ class LeanProofBranch(ProofBranch[LeanGoal, LeanTactic]):
 
     apply_tactic = to_sync(apply_tactic_async)
 
-    # TODO: def apply_tactics
-
-    async def try_apply_tactic_async(self, tactic: LeanTactic | str, timeout: int | None = 1000) -> ValueOrError[list[Self]]:
+    async def try_apply_tactic_async(
+        self, tactic: LeanTactic | str, timeout: int | None = 1000
+    ) -> ValueOrError[list[Self]]:
         try:
             return ValueOrError.from_success(await self.apply_tactic_async(tactic, timeout=timeout))
-        except (LeanInteractionException, AssertionError) as e:
+        except (LeanInteractionException, LeanProcessException, AssertionError) as e:
             return ValueOrError.from_error(e)
 
     try_apply_tactic = to_sync(try_apply_tactic_async)
+
+    async def apply_tactic_no_branching_async(
+        self,
+        tactic: LeanTactic | str,
+        timeout: int | None = 1000,
+        *,
+        include_proof_term: bool = False,
+    ) -> Self:
+        """
+        Apply tactic without partitioning goals into independent branches.
+
+        Returns a single branch with ALL resulting goals visible (no masking).
+        Use this when you need to replay a proof sequentially for proof term
+        extraction.
+
+        Unlike apply_tactic_async which returns list[LeanProofBranch] (one per
+        independent goal partition), this returns a single branch.
+
+        See docs/backends/sequential-tactic-api.md for design rationale.
+        """
+        assert not self.state.is_solved(), "This proof branch is already solved."
+        if isinstance(tactic, LeanTactic):
+            tactic = tactic.tactic
+        self._check_tactic(tactic, ban_search_tactics=True)
+
+        await self._delete_masked_goals_async()
+
+        response = await self._send_tactic_async(
+            tactic,
+            timeout=timeout,
+            include_proof_term=include_proof_term,
+        )
+        if "goals" not in response:
+            raise LeanInteractionException(
+                f"Could not apply tactic in REPL: {json.dumps(response)}"
+            )
+        new_proof_state = response["proofState"]
+        step_error = self.step_error_from_response(response)
+        if step_error:
+            raise LeanInteractionException(f"Step verification error: {step_error}")
+        new_goals = LeanProcess._goals_from_response(response)
+
+        return LeanProofBranch(
+            self._env,
+            new_proof_state,
+            new_goals,
+            goals_mask=None,
+            last_response=response,
+        )
+
+    apply_tactic_no_branching = to_sync(apply_tactic_no_branching_async)
+
+    async def try_apply_tactic_no_branching_async(
+        self,
+        tactic: LeanTactic | str,
+        timeout: int | None = 1000,
+        *,
+        include_proof_term: bool = False,
+    ) -> ValueOrError[Self]:
+        """Non-throwing version of apply_tactic_no_branching_async."""
+        try:
+            return ValueOrError.from_success(
+                await self.apply_tactic_no_branching_async(
+                    tactic,
+                    timeout=timeout,
+                    include_proof_term=include_proof_term,
+                )
+            )
+        except (LeanInteractionException, LeanProcessException, AssertionError) as e:
+            return ValueOrError.from_error(e)
+
+    try_apply_tactic_no_branching = to_sync(try_apply_tactic_no_branching_async)
 
     @classmethod
     def _check_tactic(cls, tactic: str, ban_search_tactics: bool):
@@ -743,7 +1013,9 @@ class LeanProofBranch(ProofBranch[LeanGoal, LeanTactic]):
             raise LeanInteractionException("`sorry` not allowed in `simpa`")
         # TODO: a better solution would be to report the `sorry` introduced by `apply?` and allow it (it seems that
         #  apply? creates a sorry internally)
-        if ban_search_tactics and any(tactic.startswith(banned) for banned in ["apply?", "rw?", "exact?"]):
+        if ban_search_tactics and any(
+            tactic.startswith(banned) for banned in ["apply?", "rw?", "exact?"]
+        ):
             raise LeanInteractionException("Search tactics (apply?, rw?, exact?) are not allowed.")
 
     @classmethod
@@ -755,9 +1027,38 @@ class LeanProofBranch(ProofBranch[LeanGoal, LeanTactic]):
 
 
 class LeanInteractionException(Exception):
-    def __init__(self, message: str, cause: Exception = None):
+    def __init__(
+        self,
+        message: str,
+        cause: Exception = None,
+        *,
+        error_kind: str | None = None,
+        error_summary: str | None = None,
+        repl_messages: list[dict[str, Any]] | None = None,
+    ):
         super().__init__(message)
         self.__cause__ = cause
+        self.error_kind = error_kind
+        self.error_summary = error_summary
+        self.repl_messages = normalize_repl_error_messages(repl_messages)
+
+    @classmethod
+    def from_repl_messages(
+        cls,
+        repl_messages: list[dict[str, Any]],
+        cause: Exception = None,
+    ) -> "LeanInteractionException":
+        normalized = normalize_repl_error_messages(repl_messages)
+        if normalized is None:
+            return cls("Lean REPL error", cause=cause, error_kind="repl")
+        summary = summarize_repl_error_messages(normalized)
+        return cls(
+            summary,
+            cause=cause,
+            error_kind="repl",
+            error_summary=summary,
+            repl_messages=normalized,
+        )
 
 
 class LeanProcessException(Exception):

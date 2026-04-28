@@ -76,7 +76,7 @@ class FileSpan:
             return self.read_from_string(f.read())
 
     def read_from_string(self, content: str) -> str:
-        return content[self.start.offset:self.finish.offset]
+        return content[self.start.offset : self.finish.offset]
 
     def contains(self, other: Self) -> bool:
         return self.start <= other.start <= other.finish <= self.finish
@@ -97,7 +97,11 @@ class FileSpan:
             result.append(replacement)
             curr_position = span.finish
         assert curr_position <= FilePosition.end_of_file(base_string)
-        result.append(FileSpan(curr_position, FilePosition.end_of_file(base_string)).read_from_string(base_string))
+        result.append(
+            FileSpan(curr_position, FilePosition.end_of_file(base_string)).read_from_string(
+                base_string
+            )
+        )
         return "".join(result)
 
     @classmethod
@@ -107,7 +111,9 @@ class FileSpan:
         return FileSpan(min_start, max_finish)
 
     @classmethod
-    def merge_contiguous_spans(cls, spans: list[Self], content: str, should_merge: Callable[[str], bool]) -> list[Self]:
+    def merge_contiguous_spans(
+        cls, spans: list[Self], content: str, should_merge: Callable[[str], bool]
+    ) -> list[Self]:
         if len(spans) == 0:
             return []
         spans = sorted(spans, key=lambda s: s.start)
